@@ -1,0 +1,1 @@
+Language logos (python, js, ts, java, c, cpp, csharp, go, rust, php, ruby, swift, kotlin, html, css, scss, react, npm, powershell, docker, git) come from devicon (https://devicon.dev, MIT, see LICENSE-devicon.txt). They are the trademarks of their owners. The other icons are Akolade's own.

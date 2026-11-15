@@ -1,0 +1,242 @@
+_version: 2
+# akolade: French ("fr") added for every user-visible string.
+Calendar:
+  week.0:
+    en: Su
+    fr: Di
+    zh-CN: 日
+    zh-HK: 日
+    it: Do
+  week.1:
+    en: Mo
+    fr: Lu
+    zh-CN: 一
+    zh-HK: 一
+    it: Lu
+  week.2:
+    en: Tu
+    fr: Ma
+    zh-CN: 二
+    zh-HK: 二
+    it: Ma
+  week.3:
+    en: We
+    fr: Me
+    zh-CN: 三
+    zh-HK: 三
+    it: Me
+  week.4:
+    en: Th
+    fr: Je
+    zh-CN: 四
+    zh-HK: 四
+    it: Gi
+  week.5:
+    en: Fr
+    fr: Ve
+    zh-CN: 五
+    zh-HK: 五
+    it: Ve
+  week.6:
+    en: Sa
+    fr: Sa
+    zh-CN: 六
+    zh-HK: 六
+    it: Sa
+  month.January:
+    en: January
+    fr: Janvier
+    zh-CN: 一月
+    zh-HK: 一月
+    it: Gennaio
+  month.February:
+    en: February
+    fr: Février
+    zh-CN: 二月
+    zh-HK: 二月
+    it: Febbraio
+  month.March:
+    en: March
+    fr: Mars
+    zh-CN: 三月
+    zh-HK: 三月
+    it: Marzo
+  month.April:
+    en: April
+    fr: Avril
+    zh-CN: 四月
+    zh-HK: 四月
+    it: Aprile
+  month.May:
+    en: May
+    fr: Mai
+    zh-CN: 五月
+    zh-HK: 五月
+    it: Maggio
+  month.June:
+    en: June
+    fr: Juin
+    zh-CN: 六月
+    zh-HK: 六月
+    it: Giugno
+  month.July:
+    en: July
+    fr: Juillet
+    zh-CN: 七月
+    zh-HK: 七月
+    it: Luglio
+  month.August:
+    en: August
+    fr: Août
+    zh-CN: 八月
+    zh-HK: 八月
+    it: Agosto
+  month.September:
+    en: September
+    fr: Septembre
+    zh-CN: 九月
+    zh-HK: 九月
+    it: Settembre
+  month.October:
+    en: October
+    fr: Octobre
+    zh-CN: 十月
+    zh-HK: 十月
+    it: Ottobre
+  month.November:
+    en: November
+    fr: Novembre
+    zh-CN: 十一月
+    zh-HK: 十一月
+    it: Novembre
+  month.December:
+    en: December
+    fr: Décembre
+    zh-CN: 十二月
+    zh-HK: 十二月
+    it: Dicembre
+DatePicker:
+  placeholder:
+    en: "Select date"
+    fr: "Choisir une date"
+    zh-CN: 选择日期
+    zh-HK: 選擇日期
+    it: "Seleziona data"
+Select:
+  placeholder:
+    en: "Please select"
+    fr: "Choisir…"
+    zh-CN: "请选择"
+    zh-HK: "請選擇"
+    it: Seleziona
+Dock:
+  Unnamed:
+    en: Unnamed
+    fr: "Sans nom"
+    zh-CN: 未命名
+    zh-HK: 未命名
+    it: "Senza nome"
+  Close:
+    en: Close
+    fr: Fermer
+    zh-CN: 关闭
+    zh-HK: 關閉
+    it: Chiudi
+  Zoom In:
+    en: Zoom In
+    fr: Agrandir
+    zh-CN: 放大
+    zh-HK: 放大
+    it: Zoom In
+  Zoom Out:
+    en: Zoom Out
+    fr: Réduire
+    zh-CN: 缩小
+    zh-HK: 縮小
+    it: Zoom Out
+  Collapse:
+    en: Collapse
+    fr: Masquer
+    zh-CN: 隐藏
+    zh-HK: 隱藏
+    it: Nascondi
+  Expand:
+    en: Expand
+    fr: Afficher
+    zh-CN: 展开
+    zh-HK: 展開
+    it: Espandi
+Dialog:
+  ok:
+    en: OK
+    fr: OK
+    zh-CN: 确定
+    zh-HK: 確定
+    it: OK
+  cancel:
+    en: Cancel
+    fr: Annuler
+    zh-CN: 取消
+    zh-HK: 取消
+    it: Annulla
+List:
+  search_placeholder:
+    en: Search...
+    fr: Rechercher…
+    zh-CN: 搜索...
+    zh-HK: 搜索...
+    it: Ricerca...
+Input:
+  Replace:
+    en: Replace
+    fr: Remplacer
+    zh-CN: 替换
+    zh-HK: 替換
+  Replace All:
+    en: Replace All
+    fr: Tout remplacer
+    zh-CN: 全部替换
+    zh-HK: 全部替換
+  Cut:
+    en: Cut
+    fr: Couper
+    zh-CN: 剪切
+    zh-HK: 剪切
+  Copy:
+    en: Copy
+    fr: Copier
+    zh-CN: 复制
+    zh-HK: 複製
+  Paste:
+    en: Paste
+    fr: Coller
+    zh-CN: 粘贴
+    zh-HK: 貼上
+  Select All:
+    en: Select All
+    fr: Tout sélectionner
+    zh-CN: 全选
+    zh-HK: 全選
+  Go to Definition:
+    en: Go to Definition
+    fr: Aller à la définition
+    zh-CN: 跳转到定义
+    zh-HK: 跳轉到定義
+  Show Code Actions:
+    en: Show Code Actions
+    fr: Actions de code
+    zh-CN: 显示代码操作
+    zh-HK: 顯示代碼操作
+Settings:
+  search_placeholder:
+    en: Search...
+    fr: Rechercher…
+    zh-CN: 搜索...
+    zh-HK: 搜索...
+    it: Ricerca...
+  Reset All:
+    en: Reset All
+    fr: Tout réinitialiser
+    zh-CN: 重置全部
+    zh-HK: 重置全部
+    it: Resetta Tutto

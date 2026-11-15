@@ -1,0 +1,62 @@
+[package]
+name = "akolade"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# runtime_shaders: no Xcode needed (Metal shaders compiled at launch).
+gpui = { version = "0.2.2", features = ["runtime_shaders"] }
+gpui-component = { version = "0.5.1", features = ["tree-sitter-languages"] }
+gpui-component-assets = "0.5.1"
+gpui-terminal = "0.1.0"
+portable-pty = "0.9"
+lsp-types = "0.97"
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rust-embed = "8"
+# Same versions gpui already builds: rasterize the icons and the Dock icon.
+resvg = { version = "0.45", default-features = false }
+# Default features = every format gpui already decodes (png, jpeg, gif, webp, bmp, ico, tiff…).
+image = "0.25"
+tree-sitter-php = "0.25"
+tree-sitter-kotlin-ng = "1.1"
+tree-sitter-powershell = "0.26"
+tree-sitter-containerfile = "0.9"
+tree-sitter-lua = "0.5"
+tree-sitter-hcl = "1.1"
+futures = "0.3"
+# Boîte à outils (already built for gpui and its dependencies).
+base64 = "0.22"
+sha2 = "0.10"
+percent-encoding = "2"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSData"] }
+objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSImage", "NSResponder"] }
+
+[dev-dependencies]
+# Same version as gpui-component: compiles the grammars' queries in tests.
+tree-sitter = "0.25"
+
+# gpui-component 0.5.1 with readable editor popups (hover, completion,
+# diagnostics: hardcoded 10.5–11 px → the theme's sizes). Every change is
+# marked "akolade:" in vendor/gpui-component/src/input/popovers.
+[patch.crates-io]
+gpui-component = { path = "vendor/gpui-component" }
+# gpui 0.2.2 with one fix (marked "akolade:" in src/elements/text.rs): a
+# truncated text ("…") could abort the app on a later measure.
+gpui = { path = "vendor/gpui" }
+
+# `cargo run` builds in debug: unoptimized gpui and tree-sitter took ~10 ms of
+# CPU per frame while scrolling (over the 8 ms of a 120 Hz screen, so it lagged).
+# Dependencies are built optimized once; Akolade's own code stays quick to compile.
+[profile.dev.package."*"]
+opt-level = 3
+
+# Unoptimized, the native completion took 18 ms per keystroke (3 ms here) and
+# typing cost 42 % CPU (17 %); rebuilds take ~3 s longer.
+[profile.dev.package.akolade]
+opt-level = 1
