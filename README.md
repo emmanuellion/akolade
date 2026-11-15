@@ -12,7 +12,7 @@
 <p align="center">
   <a href="https://emmanuellion.github.io/akolade/">Page de présentation</a>
   &nbsp;&nbsp;
-  <a href="#compiler-akolade">Compiler Akolade</a>
+  <a href="#installer-akolade">Télécharger</a>
   &nbsp;&nbsp;
   <a href="#raccourcis-clavier">Raccourcis</a>
 </p>
@@ -29,7 +29,7 @@ Akolade dessine son interface sur la carte graphique avec [gpui](https://www.gpu
 - [Le Store](#le-store)
 - [Sécurité : le mode restreint](#sécurité--le-mode-restreint)
 - [Performances](#performances)
-- [Compiler Akolade](#compiler-akolade)
+- [Installer Akolade](#installer-akolade)
 - [Raccourcis clavier](#raccourcis-clavier)
 - [Configurer un projet](#configurer-un-projet)
 - [Développement](#développement)
@@ -146,9 +146,20 @@ Méthode : trois lancements à froid, temps mesuré jusqu'à ce que la fenêtre 
 
 Les très longues conversations Claude Code restent fluides : seules les cartes visibles sont mises en page. Une conversation de plus de 3 000 cartes défile à 26 % de CPU, mesuré en version de développement.
 
-## Compiler Akolade
+## Installer Akolade
 
-Akolade se compile pour l'instant depuis les sources.
+### Télécharger
+
+| Système | Fichier |
+|---|---|
+| macOS 11 ou plus récent (Apple Silicon et Intel) | [`akolade-macos-universal.dmg`](https://github.com/emmanuellion/akolade/releases/latest/download/akolade-macos-universal.dmg) |
+
+1. Ouvrez le `.dmg` et glissez **Akolade** dans **Applications**.
+2. L'app n'est pas signée par Apple : au premier lancement, macOS refuse de l'ouvrir. Allez dans **Réglages Système › Confidentialité et sécurité**, puis cliquez sur **Ouvrir quand même** en face d'Akolade. Ou, dans un terminal : `xattr -dr com.apple.quarantine /Applications/Akolade.app`.
+
+Ouverte depuis le Finder ou le Dock, l'app reprend le `PATH` de votre shell : elle trouve Homebrew, Node.js, Claude Code ou Docker comme votre terminal. Chaque version publie aussi `SHA256SUMS.txt` pour vérifier le fichier. Toutes les versions sont sur la [page des releases](https://github.com/emmanuellion/akolade/releases).
+
+### Compiler depuis les sources
 
 **Il vous faut :**
 
@@ -218,9 +229,11 @@ Un fichier `akolade.json` à la racine d'un projet ajoute ou remplace la command
 ## Développement
 
 ```sh
-cargo test     # 185 tests ; certains lancent git, cargo ou un serveur de langage s'ils sont installés
+cargo test     # 186 tests ; certains lancent git, cargo ou un serveur de langage s'ils sont installés
 cargo run      # version de développement
 ```
+
+La CI lance les tests à chaque push sur `main` et `develop`. Pour publier une version : mettre à jour `version` dans `Cargo.toml`, puis pousser un tag `vX.Y.Z` sur un commit de `main`. Le workflow `release.yml` relance les tests, construit l'app universelle (Apple Silicon et Intel), le `.dmg`, et publie la release.
 
 | Dossier | Contenu |
 |---|---|

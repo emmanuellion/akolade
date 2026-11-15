@@ -1,0 +1,104 @@
+name: Release
+
+# Push a tag like v0.2.0 (matching the version in Cargo.toml) on a commit of main to build the
+# macOS app and publish a GitHub release. Run it by hand (main or develop) to only build the
+# package, downloadable from the run page: nothing is published. Releases come from main only.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+# The build job runs third-party code (crates, dmgbuild): read-only token. Only the release job writes.
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build (macOS universal)
+    runs-on: macos-latest
+    timeout-minutes: 75
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            # The tagged commit must be on main (identical to it, or behind it).
+            status=$(gh api "repos/$GITHUB_REPOSITORY/compare/main...$GITHUB_SHA" --jq .status)
+            if [[ "$status" != identical && "$status" != behind ]]; then
+              echo "::error::Le tag $GITHUB_REF_NAME n'est pas sur main : les releases se font depuis main"
+              exit 1
+            fi
+          elif [[ "$GITHUB_REF" != refs/heads/main && "$GITHUB_REF" != refs/heads/develop ]]; then
+            echo "::error::Le paquet se construit depuis main ou develop, pas depuis $GITHUB_REF_NAME"
+            exit 1
+          fi
+          version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          if [[ "$GITHUB_REF" == refs/tags/* && "$GITHUB_REF_NAME" != "v$version" ]]; then
+            echo "::error::Le tag $GITHUB_REF_NAME ne correspond pas à la version $version de Cargo.toml"
+            exit 1
+          fi
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: macos-universal
+
+      # Nothing is packaged, let alone published, from code whose tests fail.
+      - name: Tests
+        run: cargo test --release --locked
+
+      - name: Build (Apple Silicon + Intel)
+        run: |
+          cargo build --release --locked --target aarch64-apple-darwin
+          cargo build --release --locked --target x86_64-apple-darwin
+          mkdir -p dist
+          lipo -create -output dist/akolade \
+            target/aarch64-apple-darwin/release/akolade target/x86_64-apple-darwin/release/akolade
+          scripts/package-macos.sh dist/akolade "$VERSION" dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: akolade-macos-universal
+          path: dist/*.dmg
+          if-no-files-found: error
+
+  release:
+    name: GitHub release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      # Version-free names: releases/latest/download/akolade-macos-universal.dmg (used by the
+      # website) always gives the newest version.
+      - name: Stable file names
+        run: |
+          v="${GITHUB_REF_NAME#v}"
+          cd dist && for f in akolade-"$v"-*; do mv "$f" "${f/-$v/}"; done
+      - name: Checksums
+        run: cd dist && sha256sum * > SHA256SUMS.txt
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --title "Akolade $GITHUB_REF_NAME" \
+            --notes-file packaging/release-notes.md \
+            --generate-notes \
+            --verify-tag

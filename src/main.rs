@@ -19,6 +19,7 @@ mod problems;
 mod search;
 mod session;
 mod settings;
+mod shell_path;
 mod tasks;
 mod terminal;
 mod themes;
@@ -45,6 +46,8 @@ fn init_theme(cx: &mut App) {
 }
 
 fn main() {
+    // Before anything else: it sets the environment (opened from the Finder: the shell's PATH).
+    shell_path::import();
     // Optional arguments: a folder (the project) and/or files to open.
     let args: Vec<PathBuf> = std::env::args().skip(1).map(PathBuf::from).map(|p| p.canonicalize().unwrap_or(p)).collect();
 
