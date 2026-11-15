@@ -143,6 +143,12 @@ fn ident(name: &str) -> String {
 /// Runs `sql` on the database (blocking: run it in the background). Read-only
 /// unless `write`.
 pub fn query(db: &Path, sql: &str, write: bool, max: usize) -> Result<Table, String> {
+    // A WAL database with no "-wal" next to it (copied, or checkpointed): read as a frozen
+    // file at once. Opened normally, some sqlite3 versions (older macOS) create its
+    // "-wal" and "-shm" even read-only; nothing to miss either, without a "-wal".
+    if !write && is_wal(db) && !side_file(db, "-wal").exists() {
+        return run_sqlite(immutable_uri(db).as_ref(), sql, false, max);
+    }
     match run_sqlite(db.as_os_str(), sql, write, max) {
         // A WAL database read-only needs its "-shm" file, which a read-only open
         // can't create ("unable to open database file (14)"). Read it as a frozen
@@ -150,6 +156,12 @@ pub fn query(db: &Path, sql: &str, write: bool, max: usize) -> Result<Table, Str
         Err(e) if !write && e.contains("(14)") && !side_file(db, "-wal").exists() => run_sqlite(immutable_uri(db).as_ref(), sql, false, max),
         other => other,
     }
+}
+
+/// In WAL mode: bytes 18 and 19 of the header (write and read versions) are 2.
+fn is_wal(db: &Path) -> bool {
+    let mut header = [0u8; 20];
+    std::fs::File::open(db).and_then(|mut f| std::io::Read::read_exact(&mut f, &mut header)).is_ok() && header[..16] == *b"SQLite format 3\0" && header[18] == 2 && header[19] == 2
 }
 
 /// `rag.db` → `rag.db-wal`.
@@ -667,9 +679,12 @@ mod tests {
         assert_eq!(execute(&db, &format!("WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n LIMIT {}) INSERT INTO users(name) SELECT 'u' FROM n", MAX_ROWS + 500)).unwrap(), (MAX_ROWS + 500) as i64);
         assert_eq!(execute(&db, "DELETE FROM users WHERE name = 'u' RETURNING *").unwrap(), (MAX_ROWS + 500) as i64);
         assert_eq!(query(&db, "SELECT count(*) FROM users", false, 10).unwrap().rows, [[Some("2".to_string())]]);
-        // A value that is not UTF-8 neither ends the reading nor hides the rows after it.
+        // A value that is not UTF-8 neither ends the reading nor hides the rows after it
+        // (shown as "\u{fffd}" or "ÿ", depending on the sqlite3 version).
         let t = query(&db, "SELECT CAST(x'ff' AS TEXT) AS v UNION ALL SELECT 'ok'", false, 10).unwrap();
-        assert_eq!(t.rows, [[Some("\u{fffd}".to_string())], [Some("ok".to_string())]]);
+        assert_eq!(t.rows.len(), 2);
+        assert!(t.rows[0][0].as_deref().is_some_and(|v| !v.is_empty()));
+        assert_eq!(t.rows[1], [Some("ok".to_string())]);
         std::fs::remove_dir_all(dir).unwrap();
         assert!(is_sqlite(Path::new("a/b.DB")) && !is_sqlite(Path::new("db")));
     }
@@ -685,6 +700,7 @@ mod tests {
         for s in ["-shm", "-wal"] {
             let _ = std::fs::remove_file(side_file(&db, s));
         }
+        assert!(is_wal(&db) && !is_wal(&dir.join("absente.db")));
         assert_eq!(tables(&db).unwrap(), [TableInfo { name: "t".into(), view: false, rows: Some(1) }]);
         let names: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name()).collect();
         assert_eq!(names, ["r%g.db"], "reading left nothing next to it");
