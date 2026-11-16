@@ -585,6 +585,87 @@ pub fn commit(root: &Path, message: &str) -> Result<String, String> {
     git(root, &["commit", "-q", "-m", message])
 }
 
+// ---------------------------------------------------------------- worktrees (the multiplexer's Isolated sessions)
+
+/// A worktree of `repo` in `dir`, on `branch` (made from the current HEAD if new, taken
+/// as it is if it exists: a session of the same name goes on with its work).
+pub fn worktree_add(repo: &Path, dir: &Path, branch: &str) -> Result<(), String> {
+    let dir = dir.to_string_lossy();
+    if git(repo, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")]).is_ok() {
+        git(repo, &["worktree", "add", "--quiet", &dir, branch]).map(drop)
+    } else {
+        git(repo, &["worktree", "add", "--quiet", "-b", branch, &dir, "HEAD"]).map(drop)
+    }
+}
+
+/// The worktree in `dir` goes, its changes with it (its branch stays: commits are kept).
+pub fn worktree_remove(repo: &Path, dir: &Path) -> Result<(), String> {
+    git(repo, &["worktree", "remove", "--force", &dir.to_string_lossy()]).map(drop)
+}
+
+/// Forgets the worktrees whose folder is gone.
+pub fn worktree_prune(repo: &Path) {
+    let _ = git(repo, &["worktree", "prune"]);
+}
+
+/// `repo`'s worktrees (the main one first): folder and branch (None: detached).
+pub fn worktree_list(repo: &Path) -> Vec<(PathBuf, Option<String>)> {
+    parse_worktrees(&git(repo, &["worktree", "list", "--porcelain"]).unwrap_or_default())
+}
+
+pub fn parse_worktrees(out: &str) -> Vec<(PathBuf, Option<String>)> {
+    let mut list: Vec<(PathBuf, Option<String>)> = vec![];
+    for line in out.lines() {
+        if let Some(path) = line.strip_prefix("worktree ") {
+            list.push((PathBuf::from(path), None));
+        } else if let (Some(branch), Some(last)) = (line.strip_prefix("branch refs/heads/"), list.last_mut()) {
+            last.1 = Some(branch.to_string());
+        }
+    }
+    list
+}
+
+/// How a merge or a rebase ended.
+#[derive(Debug, PartialEq)]
+pub enum Integration {
+    Done,
+    /// Stopped and undone: the files both sides changed.
+    Conflict(Vec<String>),
+    /// Refused for another reason (dirty tree, unknown branch…).
+    Failed(String),
+}
+
+fn conflicted(root: &Path) -> Vec<String> {
+    git(root, &["diff", "--name-only", "--diff-filter=U"]).unwrap_or_default().lines().map(str::to_string).collect()
+}
+
+/// Merges `branch` into the current one (a merge commit, `message`); a conflict leaves nothing behind.
+pub fn merge(root: &Path, branch: &str, message: &str) -> Integration {
+    match exec(root, &["merge", "--no-ff", "--no-edit", "-m", message, branch], None, true, None) {
+        Ok(_) => Integration::Done,
+        Err(e) => {
+            let files = conflicted(root);
+            if files.is_empty() {
+                return Integration::Failed(e);
+            }
+            let _ = git(root, &["merge", "--abort"]);
+            Integration::Conflict(files)
+        }
+    }
+}
+
+/// Replays the current branch on `onto`; a conflict leaves the branch as it was.
+pub fn rebase(root: &Path, onto: &str) -> Integration {
+    match exec(root, &["rebase", onto], None, true, None) {
+        Ok(_) => Integration::Done,
+        Err(e) => {
+            let files = conflicted(root);
+            let _ = git(root, &["rebase", "--abort"]);
+            if files.is_empty() { Integration::Failed(e) } else { Integration::Conflict(files) }
+        }
+    }
+}
+
 /// One line of a diff, ready to show.
 #[derive(Clone, Debug, PartialEq)]
 pub struct DiffLine {
@@ -773,6 +854,65 @@ mod tests {
         assert!(!sub.join("new.txt").exists());
         assert!(changed(&sub, &before, &snapshot(&sub).unwrap()).unwrap().is_empty());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn worktrees_merges_and_rebases_in_a_real_repository() {
+        if !installed() {
+            return;
+        }
+        let base = std::env::temp_dir().join(format!("akolade-git-wt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let repo = base.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let g = |root: &Path, args: &[&str]| git(root, args).unwrap();
+        g(&repo, &["init", "-q", "-b", "main"]);
+        g(&repo, &["config", "user.email", "test@example.com"]);
+        g(&repo, &["config", "user.name", "Test"]);
+        std::fs::write(repo.join("a.txt"), "un\ndeux\ntrois\n").unwrap();
+        g(&repo, &["add", "."]);
+        g(&repo, &["commit", "-qm", "init"]);
+
+        // Two worktrees on their own branches, outside the repository.
+        let (wa, wb) = (base.join("wt/a"), base.join("wt/b"));
+        worktree_add(&repo, &wa, "akolade/a").unwrap();
+        worktree_add(&repo, &wb, "akolade/b").unwrap();
+        let list = worktree_list(&repo);
+        assert_eq!(list.len(), 3, "{list:?}");
+        assert!(list.iter().any(|(_, b)| b.as_deref() == Some("akolade/a")));
+        assert!(paused(&wa).is_none());
+
+        // a and b change different lines: both merge; then b changes what a changed: conflict.
+        std::fs::write(wa.join("a.txt"), "UN\ndeux\ntrois\n").unwrap();
+        g(&wa, &["commit", "-qam", "a"]);
+        std::fs::write(wb.join("a.txt"), "un\ndeux\nTROIS\n").unwrap();
+        g(&wb, &["commit", "-qam", "b"]);
+        assert_eq!(merge(&repo, "akolade/a", "Fusion de a"), Integration::Done);
+        assert_eq!(merge(&repo, "akolade/b", "Fusion de b"), Integration::Done);
+        assert_eq!(std::fs::read_to_string(repo.join("a.txt")).unwrap(), "UN\ndeux\nTROIS\n");
+        std::fs::write(wb.join("a.txt"), "Un\ndeux\nTROIS\n").unwrap();
+        g(&wb, &["commit", "-qam", "b2"]);
+        assert_eq!(merge(&repo, "akolade/b", "Fusion de b2"), Integration::Conflict(vec!["a.txt".into()]));
+        assert!(status(&repo).unwrap().changes.is_empty(), "a conflict leaves nothing behind");
+        assert_eq!(rebase(&wb, "main"), Integration::Conflict(vec!["a.txt".into()]));
+        assert_eq!(g(&wb, &["rev-parse", "--abbrev-ref", "HEAD"]).trim(), "akolade/b", "the rebase is undone");
+
+        // Removed: its folder goes, its branch stays; added again, it goes on from the branch.
+        worktree_remove(&repo, &wb).unwrap();
+        assert!(!wb.exists() && branches(&repo).contains(&"akolade/b".to_string()));
+        worktree_add(&repo, &wb, "akolade/b").unwrap();
+        assert_eq!(std::fs::read_to_string(wb.join("a.txt")).unwrap(), "Un\ndeux\nTROIS\n");
+        // A folder deleted by hand: pruned.
+        std::fs::remove_dir_all(&wa).unwrap();
+        worktree_prune(&repo);
+        assert_eq!(worktree_list(&repo).len(), 2);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn worktree_lists_are_read() {
+        let out = "worktree /r\nHEAD abc\nbranch refs/heads/main\n\nworktree /w/a\nHEAD def\nbranch refs/heads/akolade/a\n\nworktree /w/d\nHEAD 123\ndetached\n";
+        assert_eq!(parse_worktrees(out), vec![(PathBuf::from("/r"), Some("main".into())), (PathBuf::from("/w/a"), Some("akolade/a".into())), (PathBuf::from("/w/d"), None)]);
     }
 
     #[test]

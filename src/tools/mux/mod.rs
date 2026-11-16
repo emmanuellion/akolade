@@ -4,12 +4,13 @@
 //! Each panel is a `ClaudeSession` shown without the Claude Code tab's chrome.
 
 pub mod project;
+pub mod worktree;
 
 use std::path::{Path, PathBuf};
 
 use gpui::{AnyElement, AppContext, Context, Entity, FontWeight, Hsla, InteractiveElement, IntoElement, ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Subscription, WeakEntity, Window, div, prelude::FluentBuilder, relative};
 use gpui_component::{
-    ActiveTheme, Disableable, Icon, IconName, Sizable,
+    ActiveTheme, Disableable, Icon, IconName, Sizable, WindowExt,
     button::ButtonVariants,
     h_flex,
     input::{Input, InputState},
@@ -39,6 +40,9 @@ struct Slot {
     project: PathBuf,
     cwd: PathBuf,
     mode: WorkMode,
+    /// Isolated: its branch and worktree.
+    branch: Option<String>,
+    worktree: Option<PathBuf>,
     session: Entity<ClaudeSession>,
     /// Only its bar shows (its conversation is not drawn).
     folded: bool,
@@ -47,6 +51,20 @@ struct Slot {
     /// What its bar last showed: the tab redraws only when that changes, not at each streamed word.
     seen: (SessionState, u64),
     _sub: Subscription,
+}
+
+/// A session to start, as the form gave it.
+struct Launch {
+    id: String,
+    name: String,
+    role: String,
+    task: String,
+    project: PathBuf,
+    mode: WorkMode,
+    model: usize,
+    perm: usize,
+    effort: usize,
+    budget: Option<f64>,
 }
 
 /// The "Nouvelle session" form.
@@ -71,6 +89,8 @@ pub struct MuxView {
     by_project: bool,
     form: Option<Form>,
     _form_sub: Option<Subscription>,
+    /// Isolated sessions whose worktree is being made.
+    starting: Vec<String>,
     next_id: u64,
 }
 
@@ -85,8 +105,10 @@ fn name_of(p: &Path) -> String {
 }
 
 impl MuxView {
-    pub fn new(workspace: WeakEntity<Workspace>) -> Self {
-        Self { workspace, slots: vec![], by_project: true, form: None, _form_sub: None, next_id: 1 }
+    pub fn new(workspace: WeakEntity<Workspace>, cx: &mut Context<Self>) -> Self {
+        // Worktrees no session uses any more (a crash, a kill): removed, their branches kept.
+        cx.background_executor().spawn(async { worktree::cleanup(&worktree::base(), &[]) }).detach();
+        Self { workspace, slots: vec![], by_project: true, form: None, _form_sub: None, starting: vec![], next_id: 1 }
     }
 
     /// The projects in order of first appearance (their colors).
@@ -203,17 +225,46 @@ impl MuxView {
         let project = project::project_of(&folder);
         let id = format!("{}-{}", project::slug(&name), self.next_id);
         self.next_id += 1;
-        let cwd = folder.clone();
+        let launch = Launch { id, name, role, task, project, mode, model, perm, effort, budget };
+        self.form = None;
+        if mode == WorkMode::Direct {
+            return self.start(launch, folder, None, window, cx);
+        }
+        // Isolated: its worktree first (a checkout: off the UI thread), in the same subfolder as picked.
+        let rel = folder.strip_prefix(&launch.project).map(Path::to_path_buf).unwrap_or_default();
+        let (project, slug) = (launch.project.clone(), launch.id.clone());
+        self.starting.push(launch.name.clone());
+        cx.notify();
+        let made = cx.background_executor().spawn(async move { worktree::create(&worktree::base(), &project, &slug) });
+        cx.spawn_in(window, async move |this, cx| {
+            let made = made.await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.starting.retain(|n| *n != launch.name);
+                match made {
+                    Ok(wt) => this.start(launch, wt.join(rel), Some(wt), window, cx),
+                    Err(e) => {
+                        window.push_notification(gpui_component::notification::Notification::error(format!("Impossible de créer le worktree de « {} » : {e}", launch.name)), cx);
+                        cx.notify();
+                    }
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// A session in `cwd` (its worktree's, if Isolated), its first instruction sent.
+    fn start(&mut self, l: Launch, cwd: PathBuf, worktree: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
         let opts = SessionOptions {
             chrome: false,
             follow_editor: false,
             own_settings: true,
-            effort: Some(EFFORTS[effort].0.to_string()),
-            budget,
-            system_prompt: role_prompt(&name, &role),
+            effort: Some(EFFORTS[l.effort].0.to_string()),
+            budget: l.budget,
+            system_prompt: role_prompt(&l.name, &l.role),
             extra_args: vec![],
         };
         let workspace = self.workspace.clone();
+        let (model, perm) = (l.model, l.perm);
         let session = cx.new(|cx| {
             let mut s = ClaudeSession::new(workspace, Some(cwd.clone()), opts, window, cx);
             s.configure(model, perm, cx);
@@ -229,11 +280,11 @@ impl MuxView {
                 cx.notify();
             }
         });
-        if !task.is_empty() {
-            session.update(cx, |s, cx| s.submit(task, window, cx));
+        if !l.task.is_empty() {
+            session.update(cx, |s, cx| s.submit(l.task, window, cx));
         }
-        self.slots.push(Slot { id, name, role, project, cwd, mode, session, folded: false, paused: false, seen: (SessionState::Idle, 0), _sub: sub });
-        self.form = None;
+        let branch = worktree.as_ref().map(|_| worktree::branch_for(&l.id));
+        self.slots.push(Slot { id: l.id, name: l.name, role: l.role, project: l.project, cwd, mode: l.mode, branch, worktree, session, folded: false, paused: false, seen: (SessionState::Idle, 0), _sub: sub });
         cx.notify();
     }
 
@@ -257,7 +308,12 @@ impl MuxView {
     /// The session ends: its `claude` and what it runs stop (`Proc`'s drop).
     fn close(&mut self, ix: usize, cx: &mut Context<Self>) {
         if ix < self.slots.len() {
-            self.slots.remove(ix);
+            let slot = self.slots.remove(ix);
+            // Its worktree goes once `claude` has stopped (its branch stays: nothing committed is lost).
+            if let Some(wt) = slot.worktree.clone() {
+                drop(slot);
+                cx.background_executor().spawn(async move { worktree::remove(&wt) }).detach();
+            }
             cx.notify();
         }
     }
@@ -396,7 +452,10 @@ impl MuxView {
             .when(flat, |d| d.child(div().flex_shrink_0().text_size(r(12.)).text_color(color).child(name_of(&slot.project))))
             .when(!slot.role.is_empty(), |d| d.child(div().min_w_0().truncate().text_size(r(12.)).text_color(muted).child(slot.role.clone())))
             .child(div().flex_1())
-            .child(pill(slot.mode.label().into(), muted))
+            .child(pill(match &slot.branch {
+                Some(b) => format!("{} · {b}", slot.mode.label()),
+                None => slot.mode.label().into(),
+            }, muted))
             .child(pill(state_label.into(), state_color))
             .when(slot.paused, |d| d.child(pill("En pause".into(), muted)))
             .child(div().flex_shrink_0().text_size(r(12.)).text_color(muted).child(claude::usd(cost)))
@@ -567,6 +626,9 @@ impl Render for MuxView {
             .size_full()
             .child(header(t, subtitle, actions, cx))
             .children(limits_line)
+            .children(self.starting.iter().map(|name| {
+                h_flex().flex_shrink_0().gap(r(8.)).px(r(24.)).py(r(6.)).text_size(r(12.5)).text_color(muted).child(gpui_component::spinner::Spinner::new().xsmall()).child(format!("Création du worktree de « {name} »…"))
+            }))
             .children(self.render_form(cx))
             .child(div().flex_1().min_h_0().w_full().child(body).map(|d| d.h(relative(1.))))
     }
