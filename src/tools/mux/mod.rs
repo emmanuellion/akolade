@@ -170,8 +170,11 @@ impl MuxView {
                 WorkMode::Direct => None,
                 WorkMode::Isolated => {
                     let mut wt = info.checkout.clone();
-                    let known = crate::git::worktree_list(&info.project).iter().any(|(p, _)| crate::platform::canonical(p).ok() == crate::platform::canonical(&wt).ok());
-                    if !known || !wt.join(".git").exists() {
+                    let canonical = |p: &Path| crate::platform::canonical(p).ok();
+                    let known = crate::git::worktree_list(&info.project).iter().any(|(p, _)| canonical(p) == canonical(&wt));
+                    // The project's own checkout is never an isolated session's worktree (it would work in yours).
+                    let yours = canonical(&wt) == canonical(&info.project);
+                    if !known || yours || !wt.join(".git").exists() {
                         let slug = info.branch.as_deref().and_then(|b| b.strip_prefix("akolade/")).unwrap_or(&info.id).to_string();
                         match worktree::create(&worktree::base(), &info.project, &slug) {
                             // Made again (maybe elsewhere): its folder, in the same subfolder as before.
@@ -952,7 +955,7 @@ impl MuxView {
     }
 
     /// The sessions' panels: rows of up to three, resizable both ways; one section per project, or flat.
-    fn render_grid(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_grid(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         // By project: a section per shared project (its leases, its queue); the projects with one
         // session and nothing to show share rows, each bar naming its project (usage B side by side).
         let groups: Vec<(Option<PathBuf>, Vec<usize>)> = if self.by_project {
@@ -981,8 +984,8 @@ impl MuxView {
         match rows.len() {
             0 => div().into_any_element(),
             1 => self.render_row(&rows[0], cx),
-            // Two rows share the height, resizable.
-            2 => {
+            // Two rows share the height, resizable, when both keep room for their conversation.
+            2 if window.viewport_size().height >= r(1100.).to_pixels(window.rem_size()) => {
                 let both: Vec<AnyElement> = rows.iter().map(|row| self.render_row(row, cx)).collect();
                 v_resizable("mux-rows").children(both.into_iter().map(|row| resizable_panel().child(row))).into_any_element()
             }
@@ -1092,7 +1095,7 @@ fn coord_prompt(c: &coord::Coordinator, id: &str) -> String {
 }
 
 impl Render for MuxView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = tool("mux");
         let projects = self.projects().len();
         let total: f64 = self.slots.iter().map(|s| s.session.read(cx).cost()).sum();
@@ -1175,7 +1178,7 @@ impl Render for MuxView {
                 .flex_1()
                 .min_h_0()
                 .size_full()
-                .child(div().flex_1().min_w_0().h_full().p(r(10.)).child(self.render_grid(cx)))
+                .child(div().flex_1().min_w_0().h_full().p(r(10.)).child(self.render_grid(window, cx)))
                 .when(self.exchanges, |d| d.child(self.render_exchanges(cx)))
                 .into_any_element()
         };

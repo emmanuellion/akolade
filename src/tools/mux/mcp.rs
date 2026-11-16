@@ -385,4 +385,44 @@ mod tests {
         assert!(config("relay-test").contains("mcp-coord") && allowed_tools().split(',').count() == 8);
         coord::with(|c| c.remove("relay-test"));
     }
+
+    /// The real `akolade mcp-coord` process, as Claude Code starts it: JSON-RPC on its stdin,
+    /// the answers on its stdout, and it ends with stdin. Needs the built binary (`cargo build`).
+    #[test]
+    fn the_akolade_binary_relays_stdio_to_the_coordinator() {
+        use std::process::{Command, Stdio};
+        let exe = std::env::current_exe().unwrap();
+        // target/<profile>/akolade, above the test binary (deps/ or build/<pkg>/<hash>/, by cargo version).
+        let name = if cfg!(windows) { "akolade.exe" } else { "akolade" };
+        let Some(bin) = exe.ancestors().skip(1).map(|d| d.join(name)).find(|p| p.is_file()) else {
+            eprintln!("skipped: akolade not built above {}", exe.display());
+            return;
+        };
+        coord::with(|c| c.add(session("stdio-test", "/s")));
+        let e = endpoint();
+        let mut child = Command::new(&bin)
+            .args(["mcp-coord", "--session", "stdio-test"])
+            .env("AKOLADE_COORD", &e.addr)
+            .env("AKOLADE_COORD_TOKEN", &e.token)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut input = child.stdin.take().unwrap();
+        let mut output = BufReader::new(child.stdout.take().unwrap());
+        let mut ask = |msg: Value| {
+            writeln!(input, "{msg}").unwrap();
+            let mut line = String::new();
+            output.read_line(&mut line).unwrap();
+            serde_json::from_str::<Value>(&line).unwrap()
+        };
+        assert_eq!(ask(json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }))["result"]["tools"].as_array().map(Vec::len), Some(8));
+        let claimed = ask(json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": { "name": "claim_files", "arguments": { "paths": ["src/a.rs"], "intent": "test" } } }));
+        assert_eq!(claimed["id"], 2, "{claimed}");
+        assert!(coord::with(|c| c.projects.values().any(|p| p.leases.iter().any(|l| l.owner == "stdio-test"))), "the lease reached this process");
+        drop(ask);
+        drop(input);
+        assert!(child.wait().unwrap().success(), "ends with stdin");
+        coord::with(|c| c.remove("stdio-test"));
+    }
 }

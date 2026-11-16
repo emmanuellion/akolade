@@ -121,6 +121,8 @@ Côté `can_use_tool`, pour Edit, Write, MultiEdit et NotebookEdit :
 
 `akolade mcp-coord --session <id>` est un relais stdio, sans état. Il lit les lignes JSON-RPC de Claude Code, les envoie au processus principal sur `127.0.0.1:<port>` (TCP, qui marche pareil sur macOS, Linux et Windows), et recopie les réponses. Le port et un jeton aléatoire de 128 bits passent par l'`env` de `--mcp-config`. Le serveur refuse toute ligne sans le bon jeton, et une session ne peut parler qu'en son propre nom.
 
+Vérifié sur macOS et sur Linux (Debian, dans Docker) : `cargo test --locked` y passe, dont `the_akolade_binary_relays_stdio_to_the_coordinator`, qui lance le vrai binaire `akolade mcp-coord` et lui parle en JSON-RPC par stdin et stdout. Windows n'a pas été lancé : le code n'y dépend que de `TcpStream` et de `current_exe` (`akolade.exe`), mais rien n'y a tourné.
+
 Le JSON-RPC est écrit à la main avec serde_json : `initialize`, `tools/list`, `tools/call`, erreurs `-32601` / `-32602`, notifications ignorées. Les outils sont `list_sessions`, `send_message`, `broadcast`, `read_inbox`, `claim_files`, `release_files`, `list_claims` et `request_merge`.
 
 ### 2.6 File d'intégration
@@ -233,6 +235,6 @@ Les mêmes mesures **avant** les optimisations de l'étape 7 : 37 % pour une ses
 - **Panneaux en cache** (`AnyView::cached`) : un panneau ne se redessine que si sa propre session a changé, pas quand une autre écrit.
 - **Texte regroupé** : le texte reçu s'affiche par lots, au plus dix fois par seconde par session (`ClaudeSession::throttle`), sans la révélation lettre par lettre de l'onglet, qui tourne à 60 images par seconde et analyse à nouveau le Markdown à chaque image.
 - **Indicateurs fixes** : les animations d'attente redessinaient toute la fenêtre à chaque image tant qu'une session réfléchissait. Dans un panneau, l'indicateur est fixe, et la barre dit déjà « En cours ».
-- **Rien quand rien ne bouge** : au-delà de deux rangées, la grille est une `uniform_list` qui ne construit que les rangées visibles ; un panneau replié ne dessine pas sa conversation ; une fenêtre cachée ne se redessine pas.
+- **Rien quand rien ne bouge** : au-delà de deux rangées (ou dès deux quand la fenêtre fait moins de 1 100 points de haut, pour que chaque conversation garde sa place), la grille est une `uniform_list` qui ne construit que les rangées visibles ; un panneau replié ne dessine pas sa conversation ; une fenêtre cachée ne se redessine pas.
 
 Au repos, avec 6 sessions ouvertes, Akolade reste à 0,6 % (le README annonce 0,3 % pour l'éditeur seul). Le multiplexeur n'ajoute aucun sondage : ses seuls réveils sont les événements des sessions et du coordinateur.
