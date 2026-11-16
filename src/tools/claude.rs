@@ -2358,11 +2358,11 @@ impl ClaudeSession {
                         return d.child(
                             h_flex()
                                 .gap(r(8.))
-                                .child(button("claude-choices").ghost().xsmall().label(summary).icon(Icon::new(IconName::ChevronDown).xsmall()).tooltip("Changer le modèle ou le mode d'autorisation").on_click(cx.listener(|this, _, _, cx| {
+                                // A narrow panel clips the summary, never the send button.
+                                .child(div().flex_1().min_w_0().overflow_hidden().child(button("claude-choices").ghost().xsmall().label(summary).icon(Icon::new(IconName::ChevronDown).xsmall()).tooltip("Changer le modèle ou le mode d'autorisation").on_click(cx.listener(|this, _, _, cx| {
                                     this.show_choices = true;
                                     cx.notify();
-                                })))
-                                .child(div().flex_1())
+                                }))))
                                 .children(stop)
                                 .child(div().flex_shrink_0().child(send)),
                         );

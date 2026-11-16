@@ -794,7 +794,7 @@ impl MuxView {
                     .border_t_1()
                     .border_color(border)
                     .child(to)
-                    .child(h_flex().gap(r(6.)).child(div().flex_1().child(Input::new(&self.compose).small())).child(button("mux-send").small().primary().icon(IconName::ArrowUp).tooltip("Envoyer : le message arrive aussitôt aux sessions").on_click(cx.listener(|this, _, window, cx| this.send_compose(window, cx))))),
+                    .child(h_flex().w_full().gap(r(6.)).child(Input::new(&self.compose).small().flex_1()).child(button("mux-send").small().primary().icon(IconName::ArrowUp).tooltip("Envoyer : le message arrive aussitôt aux sessions").on_click(cx.listener(|this, _, window, cx| this.send_compose(window, cx))))),
             )
             .into_any_element()
     }
@@ -837,7 +837,7 @@ impl MuxView {
             })
             .when(flat, |d| d.child(div().flex_shrink_0().text_size(r(12.)).text_color(color).child(name_of(&slot.project))))
             .child(div().flex_1())
-            .child(div().id(SharedString::from(format!("mux-state-{}", slot.id))).child(pill(state_label.into(), state_color)).when_some(blocked, |d, why| d.tooltip(move |window, cx| Tooltip::new(why.clone()).build(window, cx))))
+            .child(div().id(SharedString::from(format!("mux-state-{}", slot.id))).min_w_0().overflow_hidden().whitespace_nowrap().child(pill(state_label.into(), state_color)).when_some(blocked, |d, why| d.tooltip(move |window, cx| Tooltip::new(why.clone()).build(window, cx))))
             .map(|d| {
                 if slot.paused {
                     d.child(button(SharedString::from(format!("mux-resume-{}", slot.id))).ghost().xsmall().label("Reprendre").tooltip("Elle reprend là où elle s'était arrêtée").on_click(cx.listener(move |this, _, window, cx| this.resume(ix, window, cx))))

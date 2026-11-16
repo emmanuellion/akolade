@@ -121,7 +121,7 @@ Côté `can_use_tool`, pour Edit, Write, MultiEdit et NotebookEdit :
 
 `akolade mcp-coord --session <id>` est un relais stdio, sans état. Il lit les lignes JSON-RPC de Claude Code, les envoie au processus principal sur `127.0.0.1:<port>` (TCP, qui marche pareil sur macOS, Linux et Windows), et recopie les réponses. Le port et un jeton aléatoire de 128 bits passent par l'`env` de `--mcp-config`. Le serveur refuse toute ligne sans le bon jeton, et une session ne peut parler qu'en son propre nom.
 
-Vérifié sur macOS et sur Linux (Debian, dans Docker) : `cargo test --locked` y passe, dont `the_akolade_binary_relays_stdio_to_the_coordinator`, qui lance le vrai binaire `akolade mcp-coord` et lui parle en JSON-RPC par stdin et stdout. Windows n'a pas été lancé : le code n'y dépend que de `TcpStream` et de `current_exe` (`akolade.exe`), mais rien n'y a tourné.
+Vérifié sur macOS et sur Linux (Debian, dans Docker) : `cargo test --locked` y passe, dont `the_akolade_binary_relays_stdio_to_the_coordinator`, qui lance le vrai binaire `akolade mcp-coord` et lui parle en JSON-RPC par stdin et stdout. Windows : Akolade et ses tests compilent pour `x86_64-pc-windows-gnu` (MinGW, dans Docker), et les tests du multiplexeur tournent sous Wine 8 (émulé x86_64). 17 passent, dont le relais stdio avec le vrai `akolade.exe` et la normalisation des chemins Windows ; les tests de file et de worktrees s'arrêtent d'eux-mêmes faute de Git dans Wine. `the_relay_talks_to_the_server_with_the_token` passe une fois sur trois : les autres fois, Rosetta (l'émulation x86_64 de Docker sur Apple Silicon) s'arrête sur sa propre assertion (`x86_avx_state_ptr`). Pour Wine seulement, deux petites DLL remplacent `icuuc.dll` (`u_strlen`) et `bcryptprimitives.dll` (`ProcessPrng`), absentes de Wine 8. Ce n'est pas un vrai Windows : la CI (`windows-latest`) reste la vérification de référence.
 
 Le JSON-RPC est écrit à la main avec serde_json : `initialize`, `tools/list`, `tools/call`, erreurs `-32601` / `-32602`, notifications ignorées. Les outils sont `list_sessions`, `send_message`, `broadcast`, `read_inbox`, `claim_files`, `release_files`, `list_claims` et `request_merge`.
 
@@ -236,5 +236,10 @@ Les mêmes mesures **avant** les optimisations de l'étape 7 : 37 % pour une ses
 - **Texte regroupé** : le texte reçu s'affiche par lots, au plus dix fois par seconde par session (`ClaudeSession::throttle`), sans la révélation lettre par lettre de l'onglet, qui tourne à 60 images par seconde et analyse à nouveau le Markdown à chaque image.
 - **Indicateurs fixes** : les animations d'attente redessinaient toute la fenêtre à chaque image tant qu'une session réfléchissait. Dans un panneau, l'indicateur est fixe, et la barre dit déjà « En cours ».
 - **Rien quand rien ne bouge** : au-delà de deux rangées (ou dès deux quand la fenêtre fait moins de 1 100 points de haut, pour que chaque conversation garde sa place), la grille est une `uniform_list` qui ne construit que les rangées visibles ; un panneau replié ne dessine pas sa conversation ; une fenêtre cachée ne se redessine pas.
+
+Vérifié en comptant les appels à `render` (compteur temporaire, retiré ensuite), 7 sessions sur trois rangées dans une fenêtre de 1 280 × 820 :
+- pendant 20 s où la session de la troisième rangée, hors écran, écrit un long texte : 0 rendu de son panneau, 3 de la vue du multiplexeur, 4 de chaque panneau visible (les changements d'en-tête : coût, limites) ;
+- une fois la grille défilée jusqu'à elle, son panneau se redessine normalement ;
+- au repos, pendant 30 s : 0 rendu, 0,6 % de CPU, et 2 à 3 réveils du processus par seconde (`top -stats idlew`), ceux de macOS et de gpui, sans minuteur du multiplexeur.
 
 Au repos, avec 6 sessions ouvertes, Akolade reste à 0,6 % (le README annonce 0,3 % pour l'éditeur seul). Le multiplexeur n'ajoute aucun sondage : ses seuls réveils sont les événements des sessions et du coordinateur.
