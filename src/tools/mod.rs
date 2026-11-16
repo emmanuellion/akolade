@@ -68,7 +68,7 @@ pub static TOOLS: &[Tool] = &[
         needs: None,
         icon: || Icon::new(IconName::LayoutDashboard),
         accent: |_| gpui::rgb(claude::ORANGE).into(),
-        build: |ws, _, _, cx| cx.new(|cx| mux::MuxView::new(ws, cx)).into(),
+        build: |ws, _, window, cx| cx.new(|cx| mux::MuxView::new(ws, window, cx)).into(),
     },
     Tool {
         id: "http",

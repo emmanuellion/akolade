@@ -2632,6 +2632,23 @@ impl ClaudeSession {
         }
     }
 
+    /// New instructions (its project's sessions changed): `claude` restarts on the same
+    /// conversation to read them, at once if idle, else once its turn ends.
+    pub fn set_system_prompt(&mut self, prompt: String) {
+        if self.opts.system_prompt == prompt {
+            return;
+        }
+        self.opts.system_prompt = prompt;
+        if self.proc.is_some() {
+            if self.busy {
+                self.restart = true;
+            } else {
+                self.proc = None;
+                self._reader = Task::ready(());
+            }
+        }
+    }
+
     /// Why its last write was refused.
     pub fn blocked(&self) -> Option<&str> {
         self.blocked.as_deref()

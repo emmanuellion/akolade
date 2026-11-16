@@ -64,16 +64,73 @@ pub enum WriteCheck {
     Outside,
 }
 
+/// A message between sessions (or from you: `from` is "vous").
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Message {
+    pub id: u64,
+    pub from: String,
+    /// Who it was for, as written: a session's name, "projet" or "tous".
+    pub to: String,
+    pub text: String,
+    pub at: u64,
+    /// The sessions that have not read it yet.
+    pub unread: Vec<String>,
+    /// The sender's project (the "Échanges" filter).
+    pub project: Option<PathBuf>,
+}
+
+/// Something the coordination did, for the "Échanges" panel.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Note {
+    pub at: u64,
+    pub project: Option<PathBuf>,
+    pub text: String,
+}
+
+/// A session's branch waiting to be merged into the project's `akolade/integration`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MergeRequest {
+    pub session: String,
+    pub branch: String,
+    pub summary: String,
+    pub at: u64,
+}
+
+/// The last merge tried: what happened and what the tests said.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MergeOutcome {
+    pub session: String,
+    pub branch: String,
+    pub merged: bool,
+    pub report: String,
+    pub at: u64,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ProjectState {
     pub leases: Vec<Lease>,
+    /// First in, first merged.
+    pub queue: Vec<MergeRequest>,
+    /// The one being merged and tested now.
+    pub merging: Option<MergeRequest>,
+    pub outcomes: Vec<MergeOutcome>,
+}
+
+/// Who a message goes to.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Scope {
+    Project,
+    All,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Coordinator {
     pub sessions: Vec<SessionInfo>,
+    pub messages: Vec<Message>,
+    pub notes: Vec<Note>,
+    pub next_message: u64,
     /// Per project key (`project::key`): its leases.
     #[serde(skip)]
     pub projects: BTreeMap<String, ProjectState>,
@@ -202,6 +259,100 @@ impl Coordinator {
         before - p.leases.len()
     }
 
+    /// A line in the "Échanges" panel.
+    pub fn note(&mut self, project: Option<&Path>, text: String, now: u64) {
+        self.notes.push(Note { at: now, project: project.map(Path::to_path_buf), text });
+        // shortcut: the 500 last only, the panel's reach; keep a file per day if a history is wanted.
+        if self.notes.len() > 500 {
+            self.notes.remove(0);
+        }
+    }
+
+    /// A session by its id or its name (names first in `from`'s project: two projects may both have an "api").
+    fn resolve(&self, from: Option<&str>, to: &str) -> Result<String, String> {
+        if self.session(to).is_some() {
+            return Ok(to.to_string());
+        }
+        let mine = from.and_then(|f| self.session(f)).map(|s| s.project.clone());
+        let named: Vec<&SessionInfo> = self.sessions.iter().filter(|s| s.name.eq_ignore_ascii_case(to)).collect();
+        let local: Vec<&SessionInfo> = named.iter().copied().filter(|s| Some(&s.project) == mine.as_ref()).collect();
+        match (local.as_slice(), named.as_slice()) {
+            ([one], _) | ([], [one]) => Ok(one.id.clone()),
+            ([], []) => Err(format!("Aucune session « {to} ». Celles qui existent : {}.", self.sessions.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join(", "))),
+            _ => Err(format!("Plusieurs sessions s'appellent « {to} » : donnez son identifiant ({}).", named.iter().map(|s| s.id.as_str()).collect::<Vec<_>>().join(", "))),
+        }
+    }
+
+    fn post(&mut self, from: &str, to: String, recipients: Vec<String>, text: &str, now: u64) -> u64 {
+        self.next_message += 1;
+        let project = self.session(from).map(|s| s.project.clone());
+        self.messages.push(Message { id: self.next_message, from: from.to_string(), to, text: text.to_string(), at: now, unread: recipients, project });
+        // shortcut: the 1000 last only; enough for a working day of a few sessions.
+        if self.messages.len() > 1000 {
+            self.messages.remove(0);
+        }
+        self.next_message
+    }
+
+    /// `send_message`: to one session (by id or name), of any project. `from` may be "vous".
+    pub fn send(&mut self, from: &str, to: &str, text: &str, now: u64) -> Result<String, String> {
+        let id = self.resolve(Some(from), to)?;
+        if id == from {
+            return Err("C'est vous-même : écrivez à une autre session.".into());
+        }
+        let name = self.name_of(&id);
+        self.post(from, name.clone(), vec![id], text, now);
+        Ok(name)
+    }
+
+    /// `broadcast`: to the other sessions of `from`'s project, or to all.
+    pub fn broadcast(&mut self, from: &str, scope: Scope, text: &str, now: u64) -> Vec<String> {
+        let recipients: Vec<String> = match scope {
+            Scope::Project => self.peers(from).iter().map(|s| s.id.clone()).collect(),
+            Scope::All => self.sessions.iter().filter(|s| s.id != from).map(|s| s.id.clone()).collect(),
+        };
+        let names = recipients.iter().map(|id| self.name_of(id)).collect();
+        self.post(from, if scope == Scope::All { "tous".into() } else { "projet".into() }, recipients, text, now);
+        names
+    }
+
+    /// From you (the multiplexer's box): to a session, the sessions of a project, or all.
+    pub fn send_from_user(&mut self, recipients: Vec<String>, to: String, text: &str, now: u64) {
+        self.post("vous", to, recipients, text, now);
+    }
+
+    /// `read_inbox`: the messages `id` has not read, now read.
+    pub fn inbox(&mut self, id: &str) -> Vec<Message> {
+        let mut out = vec![];
+        for m in self.messages.iter_mut().filter(|m| m.unread.iter().any(|u| u == id)) {
+            m.unread.retain(|u| u != id);
+            out.push(m.clone());
+        }
+        out
+    }
+
+    /// A message as a session reads it: "[Message de front · projet api] …".
+    pub fn render(&self, m: &Message) -> String {
+        let from = match self.session(&m.from) {
+            Some(s) => format!("{} · projet {}", s.name, s.project.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()),
+            None if m.from == "vous" => "l'utilisateur, depuis le multiplexeur".into(),
+            None => m.from.clone(),
+        };
+        format!("[Message de {from}] {}", m.text)
+    }
+
+    /// `request_merge`: the session's branch joins its project's queue (once).
+    pub fn request_merge(&mut self, id: &str, summary: &str, now: u64) -> Result<usize, String> {
+        let me = self.session(id).cloned().ok_or("Session inconnue.")?;
+        let branch = me.branch.clone().ok_or("Cette session travaille directement dans le projet (mode Directe) : il n'y a rien à fusionner, ses modifications y sont déjà.")?;
+        let p = self.projects.entry(super::project::key(&me.project)).or_default();
+        p.queue.retain(|r| r.session != id);
+        p.queue.push(MergeRequest { session: id.to_string(), branch, summary: summary.to_string(), at: now });
+        let pos = p.queue.len() + p.merging.is_some() as usize;
+        self.note(Some(&me.project), format!("{} demande la fusion de sa branche : {summary}", me.name), now);
+        Ok(pos)
+    }
+
     /// From the multiplexer: a lease ends whoever holds it.
     pub fn force_release(&mut self, project: &Path, path: &str) {
         if let Some(p) = self.projects.get_mut(&super::project::key(project)) {
@@ -305,6 +456,57 @@ mod tests {
         // A session that leaves frees all it held.
         c.remove("a");
         assert_eq!(c.check_write("b", "src/db.rs", 4), WriteCheck::Granted);
+    }
+
+    #[test]
+    fn messages_go_to_a_session_a_project_or_all_and_are_read_once() {
+        let mut c = Coordinator::default();
+        c.add(info("a", "/x", "/wt/x/a"));
+        c.add(info("b", "/x", "/wt/x/b"));
+        c.add(info("y", "/y", "/y"));
+        // By name, across projects.
+        assert_eq!(c.send("a", "y-nom", "L'API change : /users renvoie un tableau.", 1), Ok("y-nom".into()));
+        assert!(c.send("a", "a", "moi", 1).is_err());
+        assert!(c.send("a", "personne", "?", 1).unwrap_err().contains("Aucune session"));
+        // Broadcast: the project by default, everyone on demand.
+        assert_eq!(c.broadcast("a", Scope::Project, "Je prends src/api.rs", 2), ["b-nom"]);
+        assert_eq!(c.broadcast("b", Scope::All, "Pause café", 3).len(), 2);
+        let y = c.inbox("y");
+        assert_eq!(y.iter().map(|m| m.text.as_str()).collect::<Vec<_>>(), ["L'API change : /users renvoie un tableau.", "Pause café"]);
+        assert!(c.render(&y[0]).starts_with("[Message de a-nom · projet x]"));
+        assert!(c.inbox("y").is_empty(), "read once");
+        assert_eq!(c.inbox("b").len(), 1);
+        assert_eq!(c.inbox("a").len(), 1, "b's broadcast to all");
+        // Same name in two projects: the sender's project wins.
+        let mut c2 = c.clone();
+        let mut twin = info("y2", "/x", "/wt/x/y2");
+        twin.name = "y-nom".into();
+        c2.add(twin);
+        assert_eq!(c2.send("a", "y-nom", "?", 4), Ok("y-nom".into()));
+        assert_eq!(c2.inbox("y2").len(), 1);
+    }
+
+    #[test]
+    fn merge_requests_queue_in_order_per_project() {
+        let mut c = Coordinator::default();
+        let mut a = info("a", "/x", "/wt/x/a");
+        a.branch = Some("akolade/a".into());
+        let mut b = info("b", "/x", "/wt/x/b");
+        b.branch = Some("akolade/b".into());
+        let mut d = info("d", "/x", "/x");
+        d.mode = WorkMode::Direct;
+        let mut y = info("y", "/y", "/wt/y/y");
+        y.branch = Some("akolade/y".into());
+        for s in [a, b, d, y] {
+            c.add(s);
+        }
+        assert_eq!(c.request_merge("a", "route /users", 1), Ok(1));
+        assert_eq!(c.request_merge("b", "écran", 2), Ok(2));
+        assert!(c.request_merge("d", "?", 3).unwrap_err().contains("Directe"));
+        assert_eq!(c.request_merge("y", "autre projet", 4), Ok(1), "its own project's queue");
+        assert_eq!(c.request_merge("a", "route /users v2", 5), Ok(2), "asked again: back of the line");
+        let q: Vec<&str> = c.projects[&super::super::project::key(Path::new("/x"))].queue.iter().map(|r| r.session.as_str()).collect();
+        assert_eq!(q, ["b", "a"]);
     }
 
     #[test]

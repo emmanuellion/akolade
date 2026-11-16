@@ -4,6 +4,7 @@
 //! Each panel is a `ClaudeSession` shown without the Claude Code tab's chrome.
 
 pub mod coord;
+pub mod mcp;
 pub mod project;
 pub mod worktree;
 
@@ -106,15 +107,19 @@ fn name_of(p: &Path) -> String {
 }
 
 impl MuxView {
-    pub fn new(workspace: WeakEntity<Workspace>, cx: &mut Context<Self>) -> Self {
+    pub fn new(workspace: WeakEntity<Workspace>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         // Worktrees no session uses any more (a crash, a kill): removed, their branches kept.
         cx.background_executor().spawn(async { worktree::cleanup(&worktree::base(), &[]) }).detach();
         // Leases, messages, the queue: redrawn when the coordinator changes (from the MCP server too).
         let mut changes = coord::watch();
-        cx.spawn(async move |this, cx| {
+        cx.spawn_in(window, async move |this, cx| {
             use futures::StreamExt;
             while changes.next().await.is_some() {
-                if this.update(cx, |_, cx| cx.notify()).is_err() {
+                let alive = this.update_in(cx, |this, window, cx| {
+                    this.deliver(window, cx);
+                    cx.notify();
+                });
+                if alive.is_err() {
                     break;
                 }
             }
@@ -266,14 +271,36 @@ impl MuxView {
 
     /// A session in `cwd` (its worktree's, if Isolated), its first instruction sent.
     fn start(&mut self, l: Launch, cwd: PathBuf, worktree: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
+        let branch = worktree.as_ref().map(|_| worktree::branch_for(&l.id));
+        // Its paths are relative to its checkout: its worktree, or the project.
+        let checkout = crate::platform::canonical(worktree.as_deref().unwrap_or(&l.project)).unwrap_or_else(|_| worktree.clone().unwrap_or_else(|| l.project.clone()));
+        // Known to the coordinator first: its instructions name the sessions it works with.
+        coord::with(|c| {
+            c.add(coord::SessionInfo {
+                id: l.id.clone(),
+                name: l.name.clone(),
+                role: l.role.clone(),
+                project: l.project.clone(),
+                cwd: cwd.clone(),
+                checkout,
+                mode: l.mode,
+                branch: branch.clone(),
+                conversation: None,
+                model: l.model,
+                perm: l.perm,
+                effort: l.effort,
+                budget: l.budget,
+            })
+        });
         let opts = SessionOptions {
             chrome: false,
             follow_editor: false,
             own_settings: true,
             effort: Some(EFFORTS[l.effort].0.to_string()),
             budget: l.budget,
-            system_prompt: role_prompt(&l.name, &l.role),
-            extra_args: vec![],
+            system_prompt: coord::with(|c| coord_prompt(c, &l.id)),
+            // The coordination server, without touching the project's .claude/ (see docs/multiplexeur.md).
+            extra_args: vec!["--mcp-config".into(), mcp::config(&l.id), "--allowedTools".into(), mcp::allowed_tools()],
             gate: Some(gate_for(l.id.clone())),
         };
         let workspace = self.workspace.clone();
@@ -296,29 +323,33 @@ impl MuxView {
         if !l.task.is_empty() {
             session.update(cx, |s, cx| s.submit(l.task, window, cx));
         }
-        let branch = worktree.as_ref().map(|_| worktree::branch_for(&l.id));
-        // Its paths are relative to its checkout: its worktree, or the project.
-        let checkout = crate::platform::canonical(worktree.as_deref().unwrap_or(&l.project)).unwrap_or_else(|_| worktree.clone().unwrap_or_else(|| l.project.clone()));
-        coord::with(|c| {
-            c.add(coord::SessionInfo {
-                id: l.id.clone(),
-                name: l.name.clone(),
-                role: l.role.clone(),
-                project: l.project.clone(),
-                cwd: cwd.clone(),
-                checkout,
-                mode: l.mode,
-                branch: branch.clone(),
-                conversation: None,
-                model: l.model,
-                perm: l.perm,
-                effort: l.effort,
-                budget: l.budget,
-            })
-        });
-        coord::changed();
+        let project = l.project.clone();
         self.slots.push(Slot { id: l.id, name: l.name, role: l.role, project: l.project, cwd, mode: l.mode, branch, worktree, session, folded: false, paused: false, seen: (SessionState::Idle, 0), _sub: sub });
+        self.refresh_prompts(&project, cx);
+        coord::changed();
         cx.notify();
+    }
+
+    /// The sessions of `project` read who they work with again (one joined or left).
+    fn refresh_prompts(&mut self, project: &Path, cx: &mut Context<Self>) {
+        for slot in self.slots.iter().filter(|s| s.project == project) {
+            let prompt = coord::with(|c| coord_prompt(c, &slot.id));
+            slot.session.update(cx, |s, _| s.set_system_prompt(prompt));
+        }
+    }
+
+    /// Messages for the sessions: given to them at once (between two steps of a turn, or as a
+    /// new one), as written to them; a paused session gets its own at "Reprendre".
+    fn deliver(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        for slot in self.slots.iter().filter(|s| !s.paused) {
+            let text = coord::with(|c| {
+                let msgs = c.inbox(&slot.id);
+                msgs.iter().map(|m| c.render(m)).collect::<Vec<_>>().join("\n\n")
+            });
+            if !text.is_empty() {
+                slot.session.update(cx, |s, cx| s.submit(text, window, cx));
+            }
+        }
     }
 
     /// Its turn stops; the conversation stays (resumed by `resume`).
@@ -334,6 +365,8 @@ impl MuxView {
         if let Some(slot) = self.slots.get_mut(ix) {
             slot.paused = false;
             slot.session.update(cx, |s, cx| s.submit("Reprends là où tu t'étais arrêté.".into(), window, cx));
+            // The messages it got meanwhile.
+            self.deliver(window, cx);
             cx.notify();
         }
     }
@@ -343,6 +376,7 @@ impl MuxView {
         if ix < self.slots.len() {
             let slot = self.slots.remove(ix);
             coord::with(|c| c.remove(&slot.id));
+            self.refresh_prompts(&slot.project.clone(), cx);
             coord::changed();
             // Its worktree goes once `claude` has stopped (its branch stays: nothing committed is lost).
             if let Some(wt) = slot.worktree.clone() {
@@ -662,9 +696,27 @@ fn gate_for(id: String) -> claude::Gate {
 }
 
 /// What a session is told about itself (its role), added to its instructions.
-fn role_prompt(name: &str, role: &str) -> String {
-    let role = if role.is_empty() { String::new() } else { format!(" Ton rôle : {role}.") };
-    format!("Tu es la session « {name} » du multiplexeur d'Akolade, qui fait travailler plusieurs sessions Claude Code en parallèle.{role}")
+/// What a session is told of its situation (added to its instructions): alone on its
+/// project, its role and how to reach the others; sharing it, also who works with it and the rules.
+fn coord_prompt(c: &coord::Coordinator, id: &str) -> String {
+    let Some(me) = c.session(id) else { return String::new() };
+    let role = if me.role.is_empty() { String::new() } else { format!(" Ton rôle : {}.", me.role) };
+    let mut out = format!(
+        "Tu es la session « {} » du multiplexeur d'Akolade, qui fait travailler plusieurs sessions Claude Code en parallèle.{role} Les outils MCP `akolade` te relient aux autres sessions : list_sessions (scope \"tout\" pour tous les projets) et send_message pour leur écrire, même dans un autre projet. Les messages qu'on t'écrit t'arrivent comme des messages utilisateur commençant par « [Message de … ] ».",
+        me.name
+    );
+    if let Some(branch) = &me.branch {
+        out += &format!(" Tu travailles dans ton propre worktree, sur la branche {branch} : commite ton travail au fil de l'eau.");
+    }
+    let peers = c.peers(id);
+    if !peers.is_empty() {
+        let who: Vec<String> = peers.iter().map(|p| if p.role.is_empty() { p.name.clone() } else { format!("{} ({})", p.name, p.role) }).collect();
+        out += &format!(
+            " Ton projet est partagé avec : {}. Règles : réserve les fichiers avant de les modifier (claim_files) et libère-les quand tu as fini (release_files) — une écriture sur un fichier réservé par une autre session est refusée ; lis ta boîte (read_inbox) quand on t'écrit ; annonce par broadcast toute modification d'une interface partagée (API, types, schéma) ; quand ta tâche est terminée et commitée, appelle request_merge : ta branche n'est fusionnée dans akolade/integration que si le build et les tests passent.",
+            who.join(", ")
+        );
+    }
+    out
 }
 
 impl Render for MuxView {

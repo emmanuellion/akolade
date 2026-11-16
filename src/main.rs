@@ -49,6 +49,13 @@ fn init_theme(cx: &mut App) {
 }
 
 fn main() {
+    // `akolade mcp-coord --session <id>`: the multiplexer's MCP relay, started by Claude Code (no window).
+    let mut cli = std::env::args().skip(1);
+    if cli.next().as_deref() == Some("mcp-coord") {
+        let rest: Vec<String> = cli.collect();
+        let session = rest.iter().position(|a| a == "--session").and_then(|i| rest.get(i + 1)).cloned().unwrap_or_default();
+        std::process::exit(tools::mux::mcp::relay(&session));
+    }
     // Before anything else: it sets the environment (opened from the Finder: the shell's PATH).
     shell_path::import();
     // Optional arguments: a folder (the project) and/or files to open.
