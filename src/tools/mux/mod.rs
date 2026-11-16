@@ -3,6 +3,7 @@
 //! several (one session per project, the tab as a common dashboard), mixed at will.
 //! Each panel is a `ClaudeSession` shown without the Claude Code tab's chrome.
 
+pub mod coord;
 pub mod project;
 pub mod worktree;
 
@@ -108,6 +109,17 @@ impl MuxView {
     pub fn new(workspace: WeakEntity<Workspace>, cx: &mut Context<Self>) -> Self {
         // Worktrees no session uses any more (a crash, a kill): removed, their branches kept.
         cx.background_executor().spawn(async { worktree::cleanup(&worktree::base(), &[]) }).detach();
+        // Leases, messages, the queue: redrawn when the coordinator changes (from the MCP server too).
+        let mut changes = coord::watch();
+        cx.spawn(async move |this, cx| {
+            use futures::StreamExt;
+            while changes.next().await.is_some() {
+                if this.update(cx, |_, cx| cx.notify()).is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
         Self { workspace, slots: vec![], by_project: true, form: None, _form_sub: None, starting: vec![], next_id: 1 }
     }
 
@@ -262,6 +274,7 @@ impl MuxView {
             budget: l.budget,
             system_prompt: role_prompt(&l.name, &l.role),
             extra_args: vec![],
+            gate: Some(gate_for(l.id.clone())),
         };
         let workspace = self.workspace.clone();
         let (model, perm) = (l.model, l.perm);
@@ -284,6 +297,26 @@ impl MuxView {
             session.update(cx, |s, cx| s.submit(l.task, window, cx));
         }
         let branch = worktree.as_ref().map(|_| worktree::branch_for(&l.id));
+        // Its paths are relative to its checkout: its worktree, or the project.
+        let checkout = crate::platform::canonical(worktree.as_deref().unwrap_or(&l.project)).unwrap_or_else(|_| worktree.clone().unwrap_or_else(|| l.project.clone()));
+        coord::with(|c| {
+            c.add(coord::SessionInfo {
+                id: l.id.clone(),
+                name: l.name.clone(),
+                role: l.role.clone(),
+                project: l.project.clone(),
+                cwd: cwd.clone(),
+                checkout,
+                mode: l.mode,
+                branch: branch.clone(),
+                conversation: None,
+                model: l.model,
+                perm: l.perm,
+                effort: l.effort,
+                budget: l.budget,
+            })
+        });
+        coord::changed();
         self.slots.push(Slot { id: l.id, name: l.name, role: l.role, project: l.project, cwd, mode: l.mode, branch, worktree, session, folded: false, paused: false, seen: (SessionState::Idle, 0), _sub: sub });
         cx.notify();
     }
@@ -309,6 +342,8 @@ impl MuxView {
     fn close(&mut self, ix: usize, cx: &mut Context<Self>) {
         if ix < self.slots.len() {
             let slot = self.slots.remove(ix);
+            coord::with(|c| c.remove(&slot.id));
+            coord::changed();
             // Its worktree goes once `claude` has stopped (its branch stays: nothing committed is lost).
             if let Some(wt) = slot.worktree.clone() {
                 drop(slot);
@@ -435,6 +470,7 @@ impl MuxView {
             SessionState::Idle => ("Inactive", muted),
             SessionState::Working => ("En cours", green),
             SessionState::Waiting => ("Attend votre accord", yellow),
+            SessionState::Blocked => ("Bloquée par un bail", yellow),
             SessionState::Error => ("Erreur", red),
         };
         let pill = |text: String, c: Hsla| div().flex_shrink_0().px(r(6.)).py(r(1.)).rounded(r(4.)).bg(c.opacity(0.14)).text_color(c).text_size(r(11.)).child(text);
@@ -505,6 +541,47 @@ impl MuxView {
             .into_any_element()
     }
 
+    fn render_leases(&self, project: &Path, cx: &mut Context<Self>) -> AnyElement {
+        let leases = coord::with(|c| c.leases(project, coord::now()));
+        let names: Vec<(String, String)> = self.slots.iter().map(|s| (s.id.clone(), s.name.clone())).collect();
+        let theme = cx.theme();
+        let (muted, fg) = (theme.muted_foreground, theme.foreground);
+        h_flex()
+            .flex_shrink_0()
+            .flex_wrap()
+            .gap(r(6.))
+            .px(r(4.))
+            .pb(r(6.))
+            .text_size(r(11.5))
+            .child(div().text_color(muted).child(if leases.is_empty() { "Aucun bail en cours".to_string() } else { format!("{} :", ui::plural(leases.len(), "bail")).replace("bails", "baux") }))
+            .children(leases.into_iter().enumerate().map(|(i, l)| {
+                let owner = names.iter().find(|(id, _)| *id == l.owner).map_or(l.owner.clone(), |(_, n)| n.clone());
+                let (project, path) = (project.to_path_buf(), l.path.clone());
+                h_flex()
+                    .gap(r(4.))
+                    .pl(r(8.))
+                    .pr(r(2.))
+                    .py(r(1.))
+                    .rounded(r(6.))
+                    .bg(fg.opacity(0.05))
+                    .child(div().font_family(cx.theme().mono_font_family.clone()).child(l.path.clone()))
+                    .child(div().text_color(muted).child(format!("· {owner}")))
+                    .child(
+                        button(SharedString::from(format!("mux-free-{i}-{}", l.path)))
+                            .ghost()
+                            .xsmall()
+                            .icon(Icon::new(IconName::Close).xsmall())
+                            .tooltip(format!("Libérer de force ({})", l.intent))
+                            .on_click(cx.listener(move |_, _, _, cx| {
+                                coord::with(|c| c.force_release(&project, &path));
+                                coord::changed();
+                                cx.notify();
+                            })),
+                    )
+            }))
+            .into_any_element()
+    }
+
     /// The sessions' panels: rows of up to three, resizable both ways; one section per project, or flat.
     fn render_grid(&self, cx: &mut Context<Self>) -> AnyElement {
         let groups: Vec<(Option<PathBuf>, Vec<usize>)> = if self.by_project {
@@ -537,7 +614,9 @@ impl MuxView {
                         .child(div().flex_shrink_0().text_size(r(12.)).text_color(muted).child(format!("{} · {}", ui::plural(ixs.len(), "session"), claude::usd(cost))))
                 });
                 let row = h_resizable(SharedString::from(format!("mux-row-{key}-{n}"))).children(panels.into_iter().map(|p| resizable_panel().child(div().size_full().p(r(4.)).child(p))));
-                rows.push(v_flex().size_full().p(r(6.)).children(section).child(div().flex_1().min_h_0().child(row)).into_any_element());
+                // A shared project: its leases, each with its forced release.
+                let leases = project.as_ref().filter(|_| n == 0 && ixs.len() > 1).map(|p| self.render_leases(p, cx));
+                rows.push(v_flex().size_full().p(r(6.)).children(section).children(leases).child(div().flex_1().min_h_0().child(row)).into_any_element());
             }
         }
         if rows.len() == 1 {
@@ -545,6 +624,41 @@ impl MuxView {
         }
         v_resizable("mux-rows").children(rows.into_iter().map(|row| resizable_panel().child(row))).into_any_element()
     }
+}
+
+/// A file as `claude` names it, made comparable with the checkout's canonical root
+/// (macOS: /var is /private/var); a new file through its folder.
+fn canonical_file(path: &str) -> String {
+    let p = Path::new(path);
+    let canon = crate::platform::canonical(p).ok().or_else(|| {
+        let parent = crate::platform::canonical(p.parent()?).ok()?;
+        Some(parent.join(p.file_name()?))
+    });
+    canon.map_or_else(|| path.to_string(), |c| c.to_string_lossy().into_owned())
+}
+
+/// The leases, at each permission request: a write to a file another session of the
+/// project holds is refused (with who and why); a free one is taken. The modes that would
+/// skip `can_use_tool` are played here ("Modifs auto": writes allowed; "Tout autoriser": all).
+fn gate_for(id: String) -> claude::Gate {
+    std::rc::Rc::new(move |tool, input, mode, _| {
+        let write = matches!(tool, "Edit" | "Write" | "MultiEdit" | "NotebookEdit");
+        if write {
+            let path = canonical_file(input["file_path"].as_str().or(input["notebook_path"].as_str()).unwrap_or_default());
+            let check = coord::with(|c| c.check_write(&id, &path, coord::now()));
+            coord::changed();
+            if let coord::WriteCheck::Held { name, intent, .. } = check {
+                return claude::Verdict::Deny(format!(
+                    "Refusé par Akolade : ce fichier est réservé par la session « {name} » ({intent}). Ne le modifie pas maintenant : avance sur autre chose, ou écris-lui (send_message) pour qu'elle le libère, puis réessaie."
+                ));
+            }
+        }
+        match mode {
+            "bypassPermissions" => claude::Verdict::Allow,
+            "acceptEdits" if write => claude::Verdict::Allow,
+            _ => claude::Verdict::Ask,
+        }
+    })
 }
 
 /// What a session is told about itself (its role), added to its instructions.

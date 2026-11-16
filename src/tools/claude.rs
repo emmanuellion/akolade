@@ -202,9 +202,14 @@ fn permission_response(request: &str, allow: bool, input: &Value, rules: Option<
         }
         r
     } else {
-        json!({ "behavior": "deny", "message": "L'utilisateur a refusé depuis Akolade." })
+        return deny_response(request, "L'utilisateur a refusé depuis Akolade.");
     };
     json!({ "type": "control_response", "response": { "subtype": "success", "request_id": request, "response": response } })
+}
+
+/// A refusal with its reason: Claude reads it as the tool's result.
+fn deny_response(request: &str, message: &str) -> Value {
+    json!({ "type": "control_response", "response": { "subtype": "success", "request_id": request, "response": { "behavior": "deny", "message": message } } })
 }
 
 /// What "Toujours autoriser" keeps, in words ("Commande « git status », dans ce projet");
@@ -666,12 +671,28 @@ pub struct SessionOptions {
     pub system_prompt: String,
     /// More arguments for `claude` (`--mcp-config`, `--allowedTools`…).
     pub extra_args: Vec<String>,
+    /// Asked first at each permission request (see `Verdict`). With one, "Modifs auto" and
+    /// "Tout autoriser" are played by Akolade: `claude` runs in its default mode, where
+    /// each write comes to `can_use_tool` (in those two modes it never does).
+    pub gate: Option<Gate>,
 }
+
+/// A permission request settled before it reaches you.
+pub enum Verdict {
+    Allow,
+    /// Refused with this reason (Claude reads it).
+    Deny(String),
+    /// Your card, as usual.
+    Ask,
+}
+
+/// (tool, input, the mode chosen — a `MODES` value) → verdict.
+pub type Gate = std::rc::Rc<dyn Fn(&str, &Value, &str, &mut gpui::App) -> Verdict>;
 
 impl SessionOptions {
     /// The Claude Code tab.
     pub fn tab() -> Self {
-        Self { chrome: true, follow_editor: true, own_settings: false, effort: None, budget: None, system_prompt: String::new(), extra_args: vec![] }
+        Self { chrome: true, follow_editor: true, own_settings: false, effort: None, budget: None, system_prompt: String::new(), extra_args: vec![], gate: None }
     }
 }
 
@@ -744,6 +765,8 @@ pub struct ClaudeSession {
     statuses: BTreeMap<String, String>,
     toast: Option<(String, String)>,
     _toast: Task<()>,
+    /// Its last write was refused by its gate (a file another session holds): why.
+    blocked: Option<String>,
     /// The project's files at the start of the running turn (a git snapshot).
     base: Option<String>,
     /// Messages typed while the first one waits for its snapshot: sent right after it.
@@ -822,6 +845,7 @@ impl ClaudeSession {
             _toast: Task::ready(()),
             ui_seq: 0,
             base: None,
+            blocked: None,
             held: None,
             _snap: Task::ready(()),
             commands: read_json(&app_dir().join("claude-commands.json")),
@@ -1047,6 +1071,7 @@ impl ClaudeSession {
     /// it at its next step (with a command's result) or once it has answered.
     fn send(&mut self, text: String, window: &mut Window, cx: &mut Context<Self>) {
         let (Some(_), Some(root)) = (self.program.as_ref(), self.root.clone()) else { return };
+        self.blocked = None;
         // In -p mode Claude Code asks nothing: it runs the project's hooks (.claude/settings.json) at once.
         if self.proc.is_none() && !crate::trust::is_trusted(&root) {
             return self.ask_trust(text, root, window, cx);
@@ -1256,7 +1281,12 @@ impl ClaudeSession {
     fn start(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let (Some(program), Some(root)) = (self.program.clone(), self.root.clone()) else { return false };
         let settings = AppSettings::get(cx).clone();
-        match Proc::spawn(&program, &root, MODELS[self.model].1, MODES[self.mode].1, self.session.as_deref(), &settings, &self.opts) {
+        // With a gate, Akolade plays the modes that would skip it (see `SessionOptions::gate`).
+        let mode = match MODES[self.mode].1 {
+            "acceptEdits" | "bypassPermissions" if self.opts.gate.is_some() => "default",
+            m => m,
+        };
+        match Proc::spawn(&program, &root, MODELS[self.model].1, mode, self.session.as_deref(), &settings, &self.opts) {
             Ok((mut proc, mut rx)) => {
                 // The mods draw here as on Claude Code's desktop app (see `surface`).
                 proc.send(surface::attach());
@@ -1396,6 +1426,9 @@ impl ClaudeSession {
                 }
             }
             Event::ToolResult { id, text, error } => {
+                if !error {
+                    self.blocked = None;
+                }
                 let mut edited = false;
                 for item in &mut self.items {
                     if let Item::Tool { id: i, name, input, result, .. } = item
@@ -1411,6 +1444,26 @@ impl ClaudeSession {
                 }
             }
             Event::Ask { request, tool_id, tool, input, rules } => {
+                let gate = self.opts.gate.clone().filter(|_| !matches!(tool.as_str(), "AskUserQuestion" | "ExitPlanMode"));
+                let verdict = gate.map_or(Verdict::Ask, |g| g(&tool, &input, MODES[self.mode].1, cx));
+                let settled = match verdict {
+                    Verdict::Ask => None,
+                    Verdict::Allow => Some((permission_response(&request, true, &input, None), None)),
+                    Verdict::Deny(why) => Some((deny_response(&request, &why), Some(why))),
+                };
+                if let Some((msg, refused)) = settled {
+                    if let Some(p) = &mut self.proc {
+                        p.send(msg);
+                    }
+                    // Its card says it was refused (the reason comes back as its result).
+                    if let Some(why) = refused {
+                        if let Some(Item::Tool { ask, .. }) = self.items.iter_mut().find(|i| matches!(i, Item::Tool { id, .. } if *id == tool_id && !tool_id.is_empty())) {
+                            *ask = Some((request, Some(false)));
+                        }
+                        self.blocked = Some(why);
+                    }
+                    return cx.notify();
+                }
                 if always_text(&rules).is_some() {
                     self.suggested.insert(request.clone(), rules);
                 }
@@ -2558,6 +2611,8 @@ pub enum SessionState {
     Working,
     /// A permission request or a question waits for you.
     Waiting,
+    /// Its last write was refused: a file another session of its project holds.
+    Blocked,
     /// Its last word is an error (`claude` stopped, budget reached…).
     Error,
 }
@@ -2566,6 +2621,8 @@ impl ClaudeSession {
     pub fn state(&self) -> SessionState {
         if self.items.iter().any(|i| matches!(i, Item::Tool { ask: Some((_, None)), .. })) {
             SessionState::Waiting
+        } else if self.blocked.is_some() {
+            SessionState::Blocked
         } else if self.busy {
             SessionState::Working
         } else if matches!(self.items.last(), Some(Item::Notice(_, true))) {
@@ -2573,6 +2630,11 @@ impl ClaudeSession {
         } else {
             SessionState::Idle
         }
+    }
+
+    /// Why its last write was refused.
+    pub fn blocked(&self) -> Option<&str> {
+        self.blocked.as_deref()
     }
 
     pub fn cost(&self) -> f64 {
