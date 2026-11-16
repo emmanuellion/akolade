@@ -789,7 +789,7 @@ pub struct ClaudeSession {
 impl ClaudeSession {
     pub fn new(workspace: WeakEntity<Workspace>, root: Option<PathBuf>, opts: SessionOptions, window: &mut Window, cx: &mut Context<Self>) -> Self {
         // A multiplexer panel is short: one line to start with.
-        let input = cx.new(|cx| InputState::new(window, cx).multi_line(true).auto_grow(if opts.chrome { 2 } else { 1 }, 10).placeholder("Demandez quelque chose à Claude…"));
+        let input = cx.new(|cx| InputState::new(window, cx).multi_line(true).auto_grow(if opts.chrome { 2 } else { 1 }, 10).placeholder(if opts.chrome { "Demandez quelque chose à Claude…" } else { "Message à Claude…" }));
         let subs = vec![
             cx.observe_global::<AppSettings>(|this, cx| this.apply_settings(cx)),
             // The `/` suggestions follow what is typed. A first `/`: `claude` starts (no
@@ -2359,7 +2359,7 @@ impl ClaudeSession {
                             h_flex()
                                 .gap(r(8.))
                                 // A narrow panel clips the summary, never the send button.
-                                .child(div().flex_1().min_w_0().overflow_hidden().child(button("claude-choices").ghost().xsmall().label(summary).icon(Icon::new(IconName::ChevronDown).xsmall()).tooltip("Changer le modèle ou le mode d'autorisation").on_click(cx.listener(|this, _, _, cx| {
+                                .child(h_flex().flex_1().min_w_0().overflow_hidden().child(button("claude-choices").ghost().xsmall().label(summary).icon(Icon::new(IconName::ChevronDown).xsmall()).tooltip("Changer le modèle ou le mode d'autorisation").on_click(cx.listener(|this, _, _, cx| {
                                     this.show_choices = true;
                                     cx.notify();
                                 }))))
@@ -2418,6 +2418,10 @@ impl ClaudeSession {
     }
 
     fn render_empty(&self, cx: &mut Context<Self>) -> Div {
+        // A multiplexer panel: one quiet line, the bar above already says where and how it works.
+        if !self.opts.chrome {
+            return div().size_full().flex().items_center().justify_center().p(r(16.)).text_size(r(12.5)).text_color(cx.theme().muted_foreground).child("Prête : écrivez-lui ci-dessous ou depuis les Échanges.");
+        }
         let theme = cx.theme();
         let (muted, border, hover) = (theme.muted_foreground, theme.border, ui::hover_bg(cx));
         ui::empty_state(Icon::empty().path("icons/claude-code.svg"), rgb(ORANGE).into(), "Que voulez-vous faire ?", "Claude Code lit et modifie les fichiers de ce dossier, avec vos réglages, vos plugins et votre abonnement :", cx)

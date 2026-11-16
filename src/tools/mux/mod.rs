@@ -820,11 +820,14 @@ impl MuxView {
         let details = h_flex()
             .gap(r(6.))
             .min_w_0()
+            .child({
+                let (label, c) = if slot.paused { ("En pause", muted) } else { (state_label, state_color) };
+                div().id(SharedString::from(format!("mux-state-{}", slot.id))).flex_shrink_0().child(pill(label.into(), c)).when_some(blocked, |d, why| d.tooltip(move |window, cx| Tooltip::new(why.clone()).build(window, cx)))
+            })
             .child(pill(match &slot.branch {
                 Some(b) => format!("{} · {b}", slot.mode.label()),
                 None => slot.mode.label().into(),
             }, muted))
-            .when(slot.paused, |d| d.child(pill("En pause".into(), muted)))
             .child(div().flex_shrink_0().text_size(r(12.)).text_color(muted).child(claude::usd(cost)))
             .when(!slot.role.is_empty(), |d| d.child(div().min_w_0().truncate().text_size(r(12.)).text_color(muted).child(slot.role.clone())));
         let top = h_flex()
@@ -837,12 +840,13 @@ impl MuxView {
             })
             .when(flat, |d| d.child(div().flex_shrink_0().text_size(r(12.)).text_color(color).child(name_of(&slot.project))))
             .child(div().flex_1())
-            .child(div().id(SharedString::from(format!("mux-state-{}", slot.id))).min_w_0().overflow_hidden().whitespace_nowrap().child(pill(state_label.into(), state_color)).when_some(blocked, |d, why| d.tooltip(move |window, cx| Tooltip::new(why.clone()).build(window, cx))))
             .map(|d| {
                 if slot.paused {
                     d.child(button(SharedString::from(format!("mux-resume-{}", slot.id))).ghost().xsmall().label("Reprendre").tooltip("Elle reprend là où elle s'était arrêtée").on_click(cx.listener(move |this, _, window, cx| this.resume(ix, window, cx))))
+                } else if working {
+                    d.child(button(SharedString::from(format!("mux-pause-{}", slot.id))).ghost().xsmall().label("Pause").tooltip("Interrompt son tour ; « Reprendre » la relance").on_click(cx.listener(move |this, _, _, cx| this.pause(ix, cx))))
                 } else {
-                    d.child(button(SharedString::from(format!("mux-pause-{}", slot.id))).ghost().xsmall().label("Pause").tooltip("Interrompt son tour ; « Reprendre » la relance").disabled(!working).on_click(cx.listener(move |this, _, _, cx| this.pause(ix, cx))))
+                    d
                 }
             })
             .when_some(slot.worktree.clone().filter(|_| !working), |d, wt| {
@@ -1014,7 +1018,7 @@ impl MuxView {
                 .pb(r(6.))
                 .child(div().size(r(10.)).rounded_full().bg(color))
                 .child(div().text_size(r(13.5)).font_weight(FontWeight::SEMIBOLD).child(name_of(p)))
-                .child(div().min_w_0().truncate().text_size(r(12.)).text_color(muted).child(p.display().to_string()))
+                .child(div().min_w_0().truncate().text_size(r(12.)).text_color(muted).child(p.display().to_string().replacen(&crate::platform::home().display().to_string(), "~", 1)))
                 .child(div().flex_1())
                 .child(div().flex_shrink_0().text_size(r(12.)).text_color(muted).child(format!("{} · {}", ui::plural(ixs.len(), "session"), claude::usd(cost))))
         });
@@ -1190,6 +1194,6 @@ impl Render for MuxView {
                 h_flex().flex_shrink_0().gap(r(8.)).px(r(24.)).py(r(6.)).text_size(r(12.5)).text_color(muted).child(gpui_component::spinner::Spinner::new().xsmall()).child(format!("Création du worktree de « {name} »…"))
             }))
             .children(self.render_form(cx))
-            .child(div().flex_1().min_h_0().w_full().child(body).map(|d| d.h(relative(1.))))
+            .when(self.form.is_none(), |d| d.child(div().flex_1().min_h_0().w_full().child(body).map(|d| d.h(relative(1.)))))
     }
 }
