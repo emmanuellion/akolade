@@ -5,8 +5,8 @@
 <h1 align="center">Akolade</h1>
 
 <p align="center">
-  Un éditeur de code natif pour macOS, Windows et Linux, écrit en Rust.<br>
-  Git, un terminal, Claude Code et une quinzaine d'outils de développement dans la même fenêtre.
+  Un éditeur de code natif écrit en Rust, avec Claude Code intégré.<br>
+  35 langages colorés, un terminal, Git et une quinzaine d'outils. Pour macOS, Windows et Linux.
 </p>
 
 <p align="center">
