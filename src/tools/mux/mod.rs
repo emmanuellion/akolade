@@ -6,6 +6,7 @@
 pub mod coord;
 pub mod mcp;
 pub mod project;
+pub mod queue;
 pub mod worktree;
 
 use std::path::{Path, PathBuf};
@@ -93,6 +94,8 @@ pub struct MuxView {
     _form_sub: Option<Subscription>,
     /// Isolated sessions whose worktree is being made.
     starting: Vec<String>,
+    /// The project (key) whose last merge report is unfolded.
+    report: Option<String>,
     next_id: u64,
 }
 
@@ -117,6 +120,7 @@ impl MuxView {
             while changes.next().await.is_some() {
                 let alive = this.update_in(cx, |this, window, cx| {
                     this.deliver(window, cx);
+                    this.pump(cx);
                     cx.notify();
                 });
                 if alive.is_err() {
@@ -125,7 +129,7 @@ impl MuxView {
             }
         })
         .detach();
-        Self { workspace, slots: vec![], by_project: true, form: None, _form_sub: None, starting: vec![], next_id: 1 }
+        Self { workspace, slots: vec![], by_project: true, form: None, _form_sub: None, starting: vec![], report: None, next_id: 1 }
     }
 
     /// The projects in order of first appearance (their colors).
@@ -336,6 +340,113 @@ impl MuxView {
             let prompt = coord::with(|c| coord_prompt(c, &slot.id));
             slot.session.update(cx, |s, _| s.set_system_prompt(prompt));
         }
+    }
+
+    /// The integration queues: each idle project takes its next branch, merged and tested
+    /// off the UI thread; the outcome goes to the session (see `coord::finish_merge`).
+    fn pump(&mut self, cx: &mut Context<Self>) {
+        while let Some((project, req, name)) = coord::with(|c| c.next_merge()) {
+            // Its build and tests are its own code: only in a project you trust.
+            if !crate::trust::is_trusted(&project) {
+                coord::with(|c| c.finish_merge(&project, false, "Le projet est en mode restreint : Akolade ne lance pas son build ni ses tests. Approuvez-le, puis redemandez la fusion.".into(), coord::now()));
+                continue;
+            }
+            coord::changed();
+            let base = worktree::base();
+            let task = cx.background_executor().spawn({
+                let project = project.clone();
+                async move {
+                    match queue::prepare(&base, &project) {
+                        Ok(dir) => queue::integrate(&dir, &req, &name, queue::project_check),
+                        Err(e) => (false, format!("Impossible de préparer akolade/integration : {e}")),
+                    }
+                }
+            });
+            cx.spawn(async move |_, _| {
+                let (merged, report) = task.await;
+                coord::with(|c| c.finish_merge(&project, merged, report, coord::now()));
+                coord::changed();
+            })
+            .detach();
+        }
+    }
+
+    /// Your action: `akolade/integration` merged into the project's current branch (never pushed).
+    fn merge_into_yours(&mut self, project: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        let branch = crate::git::git(&project, &["rev-parse", "--abbrev-ref", "HEAD"]).map(|b| b.trim().to_string()).unwrap_or_default();
+        let detail = format!("Les branches des sessions déjà fusionnées et testées dans akolade/integration rejoignent « {branch} » dans {}. Rien n'est poussé.", project.display());
+        let answer = window.prompt(gpui::PromptLevel::Info, "Fusionner dans votre branche ?", Some(&detail), &["Fusionner", "Annuler"], cx);
+        cx.spawn_in(window, async move |_, cx| {
+            if answer.await != Ok(0) {
+                return;
+            }
+            let done = cx.background_executor().spawn(async move { crate::git::merge(&project, queue::BRANCH, "akolade : intégration des sessions du multiplexeur") }).await;
+            let _ = cx.update(|window, cx| {
+                let note = match done {
+                    crate::git::Integration::Done => gpui_component::notification::Notification::success(format!("akolade/integration est fusionnée dans « {branch} ».")),
+                    crate::git::Integration::Conflict(files) => gpui_component::notification::Notification::error(format!("Conflit avec votre branche sur {} : rien n'a été fusionné.", files.join(", "))),
+                    crate::git::Integration::Failed(e) => gpui_component::notification::Notification::error(format!("Fusion impossible : {e}")),
+                };
+                window.push_notification(note, cx);
+            });
+        })
+        .detach();
+    }
+
+    /// A shared project's integration queue: merging now, waiting, the last outcome (its report on demand).
+    fn render_queue(&self, project: &Path, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let key = project::key(project);
+        let state = coord::with(|c| c.projects.get(&key).cloned()).unwrap_or_default();
+        let names = coord::with(|c| c.sessions.iter().map(|s| (s.id.clone(), s.name.clone())).collect::<Vec<_>>());
+        let name = |id: &str| names.iter().find(|(i, _)| i == id).map_or(id.to_string(), |(_, n)| n.clone());
+        let has_branch = queue::dir(&worktree::base(), project).join(".git").exists();
+        if state.queue.is_empty() && state.merging.is_none() && state.outcomes.is_empty() && !has_branch {
+            return None;
+        }
+        let theme = cx.theme();
+        let (muted, green, red, fg) = (theme.muted_foreground, theme.green, theme.red, theme.foreground);
+        let last = state.outcomes.last().cloned();
+        let open = self.report.as_deref() == Some(key.as_str());
+        let project = project.to_path_buf();
+        Some(
+            v_flex()
+                .flex_shrink_0()
+                .gap(r(4.))
+                .px(r(4.))
+                .pb(r(6.))
+                .text_size(r(11.5))
+                .child(
+                    h_flex()
+                        .gap(r(8.))
+                        .child(div().text_color(muted).child("File d'intégration :"))
+                        .when_some(state.merging.as_ref(), |d, m| d.child(h_flex().gap(r(4.)).child(gpui_component::spinner::Spinner::new().xsmall()).child(format!("{} (fusion et tests)", name(&m.session)))))
+                        .when(!state.queue.is_empty(), |d| d.child(div().text_color(muted).child(format!("en attente : {}", state.queue.iter().map(|r| name(&r.session)).collect::<Vec<_>>().join(", ")))))
+                        .when(state.merging.is_none() && state.queue.is_empty(), |d| d.child(div().text_color(muted).child("vide")))
+                        .when_some(last.clone(), |d, o| {
+                            let k = key.clone();
+                            d.child(
+                                div()
+                                    .id(SharedString::from(format!("mux-last-{key}")))
+                                    .cursor_pointer()
+                                    .text_color(if o.merged { green } else { red })
+                                    .child(format!("{} {} {}", if o.merged { "✓" } else { "✗" }, name(&o.session), if o.merged { "fusionnée" } else { "renvoyée" }))
+                                    .tooltip(|window, cx| Tooltip::new("Voir le rapport").build(window, cx))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.report = if this.report.as_deref() == Some(k.as_str()) { None } else { Some(k.clone()) };
+                                        cx.notify();
+                                    })),
+                            )
+                        })
+                        .child(div().flex_1())
+                        .when(has_branch, |d| {
+                            d.child(button(SharedString::from(format!("mux-merge-{key}"))).xsmall().outline().label("Fusionner dans votre branche").tooltip("akolade/integration rejoint votre branche courante, sur votre action (jamais de push)").on_click(cx.listener(move |this, _, window, cx| this.merge_into_yours(project.clone(), window, cx))))
+                        }),
+                )
+                .when_some(last.filter(|_| open), |d, o| {
+                    d.child(div().id(SharedString::from(format!("mux-report-{key}"))).max_h(r(160.)).overflow_y_scroll().p(r(8.)).rounded(r(6.)).bg(fg.opacity(0.04)).font_family(cx.theme().mono_font_family.clone()).child(o.report))
+                })
+                .into_any_element(),
+        )
     }
 
     /// Messages for the sessions: given to them at once (between two steps of a turn, or as a
@@ -650,7 +761,8 @@ impl MuxView {
                 let row = h_resizable(SharedString::from(format!("mux-row-{key}-{n}"))).children(panels.into_iter().map(|p| resizable_panel().child(div().size_full().p(r(4.)).child(p))));
                 // A shared project: its leases, each with its forced release.
                 let leases = project.as_ref().filter(|_| n == 0 && ixs.len() > 1).map(|p| self.render_leases(p, cx));
-                rows.push(v_flex().size_full().p(r(6.)).children(section).children(leases).child(div().flex_1().min_h_0().child(row)).into_any_element());
+                let queue = project.as_ref().filter(|_| n == 0).and_then(|p| self.render_queue(p, cx));
+                rows.push(v_flex().size_full().p(r(6.)).children(section).children(leases).children(queue).child(div().flex_1().min_h_0().child(row)).into_any_element());
             }
         }
         if rows.len() == 1 {

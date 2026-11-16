@@ -193,6 +193,7 @@ impl Coordinator {
             && let Some(p) = self.projects.get_mut(&key)
         {
             p.leases.retain(|l| l.owner != id);
+            p.queue.retain(|r| r.session != id);
         }
         self.sessions.retain(|s| s.id != id);
     }
@@ -336,6 +337,7 @@ impl Coordinator {
         let from = match self.session(&m.from) {
             Some(s) => format!("{} · projet {}", s.name, s.project.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()),
             None if m.from == "vous" => "l'utilisateur, depuis le multiplexeur".into(),
+            None if m.from == "akolade" => "Akolade".into(),
             None => m.from.clone(),
         };
         format!("[Message de {from}] {}", m.text)
@@ -351,6 +353,38 @@ impl Coordinator {
         let pos = p.queue.len() + p.merging.is_some() as usize;
         self.note(Some(&me.project), format!("{} demande la fusion de sa branche : {summary}", me.name), now);
         Ok(pos)
+    }
+
+    /// The next branch to merge, of a project whose queue is idle: (project, request, session's name).
+    pub fn next_merge(&mut self) -> Option<(PathBuf, MergeRequest, String)> {
+        let projects: Vec<PathBuf> = self.sessions.iter().map(|s| s.project.clone()).collect();
+        for project in projects {
+            let p = self.projects.entry(super::project::key(&project)).or_default();
+            if p.merging.is_none() && !p.queue.is_empty() {
+                let req = p.queue.remove(0);
+                p.merging = Some(req.clone());
+                let name = self.name_of(&req.session);
+                return Some((project, req, name));
+            }
+        }
+        None
+    }
+
+    /// The merge being done ended: kept in the project's history, told to the session (an
+    /// Akolade message: it reads the error and fixes its branch), noted in the panel.
+    pub fn finish_merge(&mut self, project: &Path, merged: bool, report: String, now: u64) {
+        let Some(req) = self.projects.get_mut(&super::project::key(project)).and_then(|p| p.merging.take()) else { return };
+        let name = self.name_of(&req.session);
+        let p = self.projects.entry(super::project::key(project)).or_default();
+        p.outcomes.push(MergeOutcome { session: req.session.clone(), branch: req.branch.clone(), merged, report: report.clone(), at: now });
+        if p.outcomes.len() > 20 {
+            p.outcomes.remove(0);
+        }
+        let verdict = if merged { "fusionnée dans akolade/integration" } else { "renvoyée (build, tests ou conflit)" };
+        self.note(Some(project), format!("Branche {} de {name} {verdict}", req.branch), now);
+        if self.session(&req.session).is_some() {
+            self.post("akolade", name, vec![req.session], &format!("File d'intégration — {report}"), now);
+        }
     }
 
     /// From the multiplexer: a lease ends whoever holds it.
@@ -507,6 +541,14 @@ mod tests {
         assert_eq!(c.request_merge("a", "route /users v2", 5), Ok(2), "asked again: back of the line");
         let q: Vec<&str> = c.projects[&super::super::project::key(Path::new("/x"))].queue.iter().map(|r| r.session.as_str()).collect();
         assert_eq!(q, ["b", "a"]);
+        // One at a time per project, first asked first; projects do not wait for each other.
+        let (p1, r1, _) = c.next_merge().unwrap();
+        let (p2, r2, _) = c.next_merge().unwrap();
+        assert_eq!((p1.as_path(), r1.session.as_str(), p2.as_path(), r2.session.as_str()), (Path::new("/x"), "b", Path::new("/y"), "y"));
+        assert!(c.next_merge().is_none(), "/x is busy with b");
+        c.finish_merge(Path::new("/x"), false, "tests en échec".into(), 6);
+        assert!(c.inbox("b")[0].text.contains("tests en échec"), "the session is told");
+        assert_eq!(c.next_merge().unwrap().1.session, "a");
     }
 
     #[test]
