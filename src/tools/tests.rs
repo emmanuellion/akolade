@@ -21,6 +21,7 @@ use gpui_component::{ActiveTheme, Icon, IconName, Sizable, button::ButtonVariant
 use serde::Deserialize;
 
 use crate::{
+    ui::plural,
     tools::{header, tool},
     ui,
     workspace::{Workspace, button, r},
@@ -508,10 +509,6 @@ pub fn execute(runner: Runner, root: &Path, failed: &[TestCase], pid: &AtomicU32
 
 fn duration_fr(secs: f32) -> String {
     if secs < 60. { format!("{secs:.1} s").replace('.', ",") } else { format!("{} min {:02} s", secs as u32 / 60, secs as u32 % 60) }
-}
-
-fn plural(n: usize, word: &str) -> String {
-    format!("{n} {word}{}", if n > 1 { "s" } else { "" })
 }
 
 pub struct TestsView {

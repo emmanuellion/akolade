@@ -119,7 +119,7 @@ pub fn timestamp(s: &str) -> Result<String, String> {
 }
 
 /// A random version-4 UUID.
-fn uuid_v4() -> String {
+pub(crate) fn uuid_v4() -> String {
     let mut b = [0u8; 16];
     // The system's generator (getrandom on Linux, SecRandom on macOS, BCrypt on Windows).
     let _ = getrandom::fill(&mut b);

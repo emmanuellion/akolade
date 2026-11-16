@@ -169,9 +169,11 @@ fn custom() -> std::sync::MutexGuard<'static, Option<Vec<&'static Palette>>> {
     guard
 }
 
-/// The built-in themes, then the imported ones.
+/// The built-in themes and the imported ones, by name.
 pub fn all() -> Vec<&'static Palette> {
-    THEMES.iter().chain(custom().as_ref().into_iter().flatten().copied()).collect()
+    let mut all: Vec<&'static Palette> = THEMES.iter().chain(custom().as_ref().into_iter().flatten().copied()).collect();
+    all.sort_by_cached_key(|t| crate::ui::sort_key(t.name));
+    all
 }
 
 /// A theme file's name: letters and digits of the theme's name.

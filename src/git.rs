@@ -66,13 +66,13 @@ pub struct Commit {
 
 /// Runs git in `root`. Ok: its output; Err: what it said went wrong.
 pub fn git(root: &Path, args: &[&str]) -> Result<String, String> {
-    exec(root, args, None, false)
+    exec(root, args, None, false, None)
 }
 
 /// After a user action: saves the stat cache that background reads (no optional
 /// locks) never write, so polls stop rehashing files touched with the same content.
 pub fn refresh_index(root: &Path) {
-    let _ = exec(root, &["update-index", "-q", "--refresh"], None, true);
+    let _ = exec(root, &["update-index", "-q", "--refresh"], None, true, None);
 }
 
 /// A repository's own setting that makes git run a command. A project downloaded
@@ -123,7 +123,8 @@ pub fn paused(root: &Path) -> Option<String> {
 }
 
 /// `input`: written to git's stdin. `locks`: may take index.lock for optional writes.
-fn exec(root: &Path, args: &[&str], input: Option<String>, locks: bool) -> Result<String, String> {
+/// `index`: another index file than the repository's (`GIT_INDEX_FILE`).
+fn exec(root: &Path, args: &[&str], input: Option<String>, locks: bool, index: Option<&Path>) -> Result<String, String> {
     if let Some(what) = paused(root) {
         return Err(format!("Git est en pause : ce dépôt configure une commande ({what}). Cliquez sur « Mode restreint » en bas de la fenêtre si vous lui faites confiance."));
     }
@@ -138,6 +139,9 @@ fn exec(root: &Path, args: &[&str], input: Option<String>, locks: bool) -> Resul
         .stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    if let Some(index) = index {
+        cmd.env("GIT_INDEX_FILE", index);
+    }
     if !locks {
         // Background reads (status every few seconds) must not take index.lock from the user's git.
         cmd.env("GIT_OPTIONAL_LOCKS", "0");
@@ -485,6 +489,62 @@ pub fn diff(root: &Path, change: &Change, staged: bool) -> String {
     git(root, &[args, &[change.path.as_str()]].concat()).unwrap_or_else(|e| e)
 }
 
+/// Runs `f` with a copy of the repository's index: the user's own stays as it is.
+fn with_index<T>(root: &Path, f: impl FnOnce(&Path) -> Result<T, String>) -> Result<T, String> {
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let copy = std::env::temp_dir().join(format!("akolade-index-{}-{}", std::process::id(), N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
+    // Its stat cache: only the files changed since are read again. No index yet: an empty one.
+    let _ = git(root, &["rev-parse", "--git-path", "index"]).map(|p| std::fs::copy(root.join(p.trim()), &copy));
+    let out = f(&copy);
+    let _ = std::fs::remove_file(&copy);
+    out
+}
+
+/// The files under `root` as they are now (untracked ones too, ignored ones not), as a
+/// tree in the repository's objects: nothing else changes (index, branches, stash).
+/// shortcut: a big untracked folder that is not ignored gets hashed at each call; ignore it if it shows.
+pub fn snapshot(root: &Path) -> Result<String, String> {
+    with_index(root, |index| {
+        exec(root, &["add", "-A", "--", "."], None, true, Some(index))?;
+        exec(root, &["write-tree"], None, true, Some(index)).map(|t| t.trim().to_string())
+    })
+}
+
+/// The files under `root` that differ between two snapshots: (A, M, D or T, path from `root`).
+pub fn changed(root: &Path, before: &str, after: &str) -> Result<Vec<(char, String)>, String> {
+    let out = git(root, &["diff-tree", "-r", "-z", "--no-renames", "--name-status", "--relative", before, after])?;
+    let mut parts = out.split('\0');
+    let mut files = vec![];
+    while let (Some(status), Some(path)) = (parts.next(), parts.next()) {
+        files.extend(status.chars().next().map(|c| (c, path.to_string())));
+    }
+    Ok(files)
+}
+
+/// One file's diff between two snapshots.
+pub fn tree_diff(root: &Path, before: &str, after: &str, path: &str) -> String {
+    git(root, &["diff", "--no-ext-diff", "--no-color", "--relative", before, after, "--", path]).unwrap_or_else(|e| e)
+}
+
+/// Puts `files` (from `changed`) back as they are in the snapshot `tree`: those it
+/// did not have (A) are deleted.
+pub fn restore(root: &Path, tree: &str, files: &[(char, String)]) -> Result<(), String> {
+    let back: Vec<&str> = files.iter().filter(|f| f.0 != 'A').map(|f| f.1.as_str()).collect();
+    if !back.is_empty() {
+        with_index(root, |index| {
+            exec(root, &["read-tree", tree], None, true, Some(index))?;
+            exec(root, &["checkout-index", "-f", "-z", "--stdin"], Some(back.join("\0")), true, Some(index)).map(drop)
+        })?;
+    }
+    for (_, path) in files.iter().filter(|f| f.0 == 'A') {
+        match std::fs::remove_file(root.join(path)) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(format!("{path} : {e}")),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 pub fn show(root: &Path, hash: &str) -> String {
     git(root, &["show", "--no-ext-diff", "--no-color", "--format=%H%n%an <%ae>%n%ad%n%n%B", hash]).unwrap_or_else(|e| e)
 }
@@ -498,7 +558,7 @@ fn with_paths(root: &Path, args: &[&str], paths: &[&str]) -> Result<String, Stri
     if paths.len() <= MAX_ARG_PATHS {
         return git(root, &[args, &["--"], paths].concat());
     }
-    exec(root, &[args, &["--pathspec-from-file=-", "--pathspec-file-nul"]].concat(), Some(paths.join("\0")), false)
+    exec(root, &[args, &["--pathspec-from-file=-", "--pathspec-file-nul"]].concat(), Some(paths.join("\0")), false, None)
 }
 
 pub fn stage(root: &Path, paths: &[&str]) -> Result<String, String> {
@@ -683,6 +743,38 @@ mod tests {
     }
 
     /// End to end on a real repository (skipped without git).
+    #[test]
+    fn snapshots_list_and_undo_changes_without_touching_the_index() {
+        if !installed() {
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("akolade-git-snap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        let g = |args: &[&str]| git(&root, args).unwrap();
+        g(&["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("sub/a.txt"), "one\n").unwrap();
+        std::fs::write(root.join("sub/gone.txt"), "x").unwrap();
+        g(&["add", "sub/a.txt"]);
+        let sub = root.join("sub");
+        let before = snapshot(&sub).unwrap();
+        std::fs::write(sub.join("a.txt"), "two\n").unwrap();
+        std::fs::write(sub.join("new.txt"), "new").unwrap();
+        std::fs::remove_file(sub.join("gone.txt")).unwrap();
+        let after = snapshot(&sub).unwrap();
+        let files = changed(&sub, &before, &after).unwrap();
+        assert_eq!(files, vec![('M', "a.txt".to_string()), ('D', "gone.txt".to_string()), ('A', "new.txt".to_string())]);
+        assert!(tree_diff(&sub, &before, &after, "a.txt").contains("-one\n+two"));
+        // The user's index: still only a.txt as added, with its first content.
+        assert_eq!(g(&["diff", "--cached", "--name-only"]).trim(), "sub/a.txt");
+        restore(&sub, &before, &files).unwrap();
+        assert_eq!(std::fs::read_to_string(sub.join("a.txt")).unwrap(), "one\n");
+        assert_eq!(std::fs::read_to_string(sub.join("gone.txt")).unwrap(), "x");
+        assert!(!sub.join("new.txt").exists());
+        assert!(changed(&sub, &before, &snapshot(&sub).unwrap()).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn stage_commit_and_branch_in_a_real_repository() {
         if !installed() {

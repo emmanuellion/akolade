@@ -164,6 +164,8 @@ pub struct Client {
     /// Set once stopped: a late `publishDiagnostics` must not undo `clear_origin`.
     /// A lock, not an atomic: the reader checks and writes under it.
     stopped: Arc<Mutex<bool>>,
+    /// Its last diagnostics per file uri, as it sent them: quick fixes are asked with them.
+    diagnostics: Arc<Mutex<HashMap<String, Value>>>,
     child: Mutex<Child>,
 }
 
@@ -211,6 +213,7 @@ impl Client {
         let alive = Arc::new(AtomicBool::new(true));
         let incremental = Arc::new(AtomicBool::new(false));
         let stopped = Arc::new(Mutex::new(false));
+        let diagnostics: Arc<Mutex<HashMap<String, Value>>> = Arc::default();
 
         let root_uri = uri(root);
         let init = json!({
@@ -229,6 +232,12 @@ impl Client {
                         "definition": { "linkSupport": true },
                         "references": {},
                         "rename": { "prepareSupport": false },
+                        // Actions as literals (not bare commands), their edits resolved on demand.
+                        "codeAction": {
+                            "codeActionLiteralSupport": { "codeActionKind": { "valueSet": ["", "quickfix", "refactor", "refactor.extract", "refactor.inline", "refactor.rewrite", "source", "source.organizeImports", "source.fixAll"] } },
+                            "resolveSupport": { "properties": ["edit"] },
+                            "dataSupport": true,
+                        },
                     },
                     "workspace": { "configuration": true, "workspaceFolders": true },
                 },
@@ -246,7 +255,7 @@ impl Client {
             }
         });
 
-        let (waiting, reply, running, ranges, halted) = (pending.clone(), outgoing.clone(), alive.clone(), incremental.clone(), stopped.clone());
+        let (waiting, reply, running, ranges, halted, raw) = (pending.clone(), outgoing.clone(), alive.clone(), incremental.clone(), stopped.clone(), diagnostics.clone());
         thread::spawn(move || {
             let mut input = BufReader::new(stdout);
             while let Some(msg) = read_message(&mut input) {
@@ -271,6 +280,9 @@ impl Client {
                         }
                     }
                     (None, Some("textDocument/publishDiagnostics")) => {
+                        if let Some(uri) = msg["params"]["uri"].as_str() {
+                            raw.lock().unwrap().insert(uri.to_string(), msg["params"]["diagnostics"].clone());
+                        }
                         let halted = halted.lock().unwrap();
                         if let Some((path, list)) = problems::from_lsp(&msg["params"], origin).filter(|_| !*halted) {
                             problems.set(path, origin, list);
@@ -292,6 +304,7 @@ impl Client {
             alive,
             incremental,
             stopped,
+            diagnostics,
             child: Mutex::new(child),
         }))
     }
@@ -387,6 +400,21 @@ impl Client {
             "textDocument/references",
             json!({ "textDocument": { "uri": uri(path) }, "position": { "line": line, "character": character }, "context": { "includeDeclaration": true } }),
         )
+    }
+
+    /// The fixes and refactorings offered at this position (CodeAction and Command
+    /// literals), given the diagnostics on its line.
+    pub fn code_actions(&self, path: &Path, line: usize, character: usize) -> oneshot::Receiver<Value> {
+        let uri = uri(path);
+        let on_line = |d: &&Value| (d["range"]["start"]["line"].as_u64().unwrap_or(0)..=d["range"]["end"]["line"].as_u64().unwrap_or(0)).contains(&(line as u64));
+        let diagnostics: Vec<Value> = self.diagnostics.lock().unwrap().get(&uri).and_then(Value::as_array).into_iter().flatten().filter(on_line).cloned().collect();
+        let at = json!({ "line": line, "character": character });
+        self.request("textDocument/codeAction", json!({ "textDocument": { "uri": uri }, "range": { "start": at, "end": at }, "context": { "diagnostics": diagnostics } }))
+    }
+
+    /// An action's edit, for servers that send it only once chosen.
+    pub fn resolve_action(&self, action: &Value) -> oneshot::Receiver<Value> {
+        self.request("codeAction/resolve", action.clone())
     }
 
     /// The edits renaming the symbol at this position everywhere (a WorkspaceEdit).
@@ -736,5 +764,30 @@ mod tests {
         let src = "import * as lib from './lib.js';\nlib.";
         let labels = complete_with("typescript-language-server", &["--stdio"], "javascript", "b.js", src, &["hello", "VERSION"]).unwrap();
         assert!(labels.contains(&"hello".into()) && labels.contains(&"VERSION".into()), "{labels:?}");
+    }
+
+    #[test]
+    fn typescript_offers_a_quick_fix_for_a_typo() {
+        let Some(program) = find_program("typescript-language-server") else { return };
+        let dir = std::env::temp_dir().join(format!("akolade-lsp-{}-fix", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (file, src) = (dir.join("a.ts"), "const userName = 1;\nconsole.log(userNam);\n");
+        std::fs::write(&file, src).unwrap();
+        let client = Client::start(&program, &["--stdio"], tsserver_options(&program), &dir, Arc::default(), "test").unwrap();
+        client.sync(&file, "typescript", src);
+        // The fix comes with the diagnostic: asked again until the server has sent it.
+        let mut fix = None;
+        for _ in 0..30 {
+            let actions = futures::executor::block_on(client.code_actions(&file, 1, 14)).unwrap();
+            fix = actions.as_array().into_iter().flatten().find(|a| a["title"].as_str().is_some_and(|t| t.contains("'userName'"))).cloned();
+            if fix.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        let fix = fix.expect("a spelling fix");
+        let fix = if fix["edit"].is_object() { fix } else { futures::executor::block_on(client.resolve_action(&fix)).unwrap() };
+        let files = crate::completion::workspace_edits(&fix["edit"]);
+        assert_eq!(crate::completion::apply_edits(src, &files[0].1), "const userName = 1;\nconsole.log(userName);\n");
     }
 }

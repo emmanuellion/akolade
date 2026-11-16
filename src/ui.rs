@@ -6,6 +6,34 @@ use gpui_component::{ActiveTheme, Icon, IconName, Sizable, spinner::Spinner, v_f
 
 use crate::workspace::r;
 
+/// "1 fichier", "3 fichiers".
+pub fn plural(n: usize, word: &str) -> String {
+    format!("{n} {word}{}", if n > 1 { "s" } else { "" })
+}
+
+/// A name as lists sort it: case and accents aside ("Éclat" between "Ébène"… and "Encre").
+pub fn sort_key(name: &str) -> String {
+    name.to_lowercase()
+        .chars()
+        .map(|c| match c {
+            'à' | 'â' | 'ä' | 'á' => 'a',
+            'é' | 'è' | 'ê' | 'ë' => 'e',
+            'î' | 'ï' | 'í' => 'i',
+            'ô' | 'ö' | 'ó' => 'o',
+            'ù' | 'û' | 'ü' | 'ú' => 'u',
+            'ç' => 'c',
+            c => c,
+        })
+        .collect()
+}
+
+#[test]
+fn names_sort_without_case_or_accents() {
+    let mut names = ["Océan", "encre", "Éclat", "Aube", "Pêche", "Papier"];
+    names.sort_by_key(|n| sort_key(n));
+    assert_eq!(names, ["Aube", "Éclat", "encre", "Océan", "Papier", "Pêche"]);
+}
+
 /// The hover background of a clickable row or card, everywhere.
 pub fn hover_bg(cx: &App) -> Hsla {
     cx.theme().foreground.opacity(0.05)

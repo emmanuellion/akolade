@@ -60,7 +60,7 @@ use crate::{
 
 actions!(
     akolade,
-    [Save, Run, CloseTab, NewFile, OpenFile, OpenFolder, CloseFolder, ToggleTerminal, ToggleSidebar, OpenSettings, OpenPlugins, NextTab, PrevTab, ReopenTab, ZoomIn, ZoomOut, ZoomReset, Format, OpenGit, OpenSearch, GoToDefinitionKey, FindReferences, RenameSymbol, SplitEditor, LintFile, CopyFilePath, CopyRelativePath, RevealInExplorer, ShowFileChanges]
+    [Save, Run, CloseTab, NewFile, OpenFile, OpenFolder, CloseFolder, ToggleTerminal, ToggleSidebar, OpenSettings, OpenPlugins, NextTab, PrevTab, ReopenTab, ZoomIn, ZoomOut, ZoomReset, Format, OpenGit, OpenSearch, GoToDefinitionKey, FindReferences, RenameSymbol, QuickFix, SplitEditor, LintFile, CopyFilePath, CopyRelativePath, RevealInExplorer, ShowFileChanges]
 );
 
 /// ⌘1…⌘9: that tab (⌘9 the last one, like browsers).
@@ -332,6 +332,7 @@ fn context_menu(menu: PopupMenu, ws: gpui::WeakEntity<Workspace>, lang: &'static
     menu.menu_with_enable("Aller à la définition", Box::new(GoToDefinitionKey), server && has_path)
         .menu_with_enable("Trouver les références", Box::new(FindReferences), server && has_path)
         .menu_with_enable("Renommer le symbole…", Box::new(RenameSymbol), server && has_path)
+        .menu_with_enable("Corrections rapides…", Box::new(QuickFix), server && has_path)
         .separator()
         .menu_with_enable("Formater le document", Box::new(Format), formatter)
         .menu_with_enable("Vérifier le fichier (linters)", Box::new(LintFile), linter)
@@ -383,8 +384,10 @@ fn modified(path: &Path) -> Option<SystemTime> {
     fs::metadata(path).and_then(|m| m.modified()).ok()
 }
 
+/// One word for the terminal's shell, whatever it holds: PowerShell on Windows
+/// (`''` inside), a POSIX shell elsewhere (`'\''` inside).
 pub fn shell_quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', r"'\''"))
+    if cfg!(windows) { format!("'{}'", s.replace('\'', "''")) } else { format!("'{}'", s.replace('\'', r"'\''")) }
 }
 
 /// Code blocks of a preview that get syntax colors. gpui-component compiles the
@@ -489,7 +492,8 @@ fn expand_run(cmd: &str, file: &Path, env: &HashMap<String, String>) -> String {
         return cmd;
     }
     vars.sort();
-    format!("export {}; {cmd}", vars.join(" "))
+    // PowerShell has no `export`: each variable is set on its own.
+    if cfg!(windows) { format!("{}; {cmd}", vars.iter().map(|v| format!("$env:{v}")).collect::<Vec<_>>().join("; ")) } else { format!("export {}; {cmd}", vars.join(" ")) }
 }
 
 fn home() -> PathBuf {
@@ -815,11 +819,10 @@ impl Workspace {
         self.open_tool(id, window, cx);
     }
 
-    /// Tools take the whole editor area without a tab: leaving one shows the last
-    /// file tab again (or the welcome page when there is none).
+    /// Leaving a tool by its icon shows the last file tab again (or the welcome page when there is none).
     fn hide_tool(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let last = self.last_file.and_then(|id| self.buffers.iter().position(|b| b.id() == id));
-        match last.or_else(|| self.tab_indices().last().copied()) {
+        match last.or_else(|| self.buffers.iter().rposition(|b| !matches!(b.view, View::Tool { .. }))) {
             Some(ix) => self.activate(ix, window, cx),
             None => {
                 self.active = self.buffers.len(); // no tab: the welcome page
@@ -829,9 +832,9 @@ impl Workspace {
         }
     }
 
-    /// The buffers shown as tabs, in order: files, settings, the Store (tools have none).
+    /// The buffers shown as tabs, in order: files, settings, the Store, tools.
     fn tab_indices(&self) -> Vec<usize> {
-        self.buffers.iter().enumerate().filter(|(_, b)| !matches!(b.view, View::Tool { .. })).map(|(ix, _)| ix).collect()
+        (0..self.buffers.len()).collect()
     }
 
     pub fn open_search(&mut self, _: &OpenSearch, window: &mut Window, cx: &mut Context<Self>) {
@@ -1130,11 +1133,92 @@ impl Workspace {
     }
 
     fn rename_with(&mut self, path: PathBuf, client: Arc<lsp::Client>, (line, col): (usize, usize), old: String, new: String, window: &mut Window, cx: &mut Context<Self>) {
-        // The server gets every open tab of this language as it is now, and we keep
-        // that text: its edits are offsets in it. A tab typed in during the wait (its
-        // sync would hide the change) or a file changed elsewhere then gets nothing.
+        let sent = self.sync_tabs_of(&path, &client, cx);
+        let (rx, timer) = (client.rename(&path, line, col, &new), cx.background_executor().timer(Duration::from_secs(8)));
+        self.set_busy(Some("Renommage…"), cx);
+        cx.spawn_in(window, async move |this, cx| {
+            let files = completion::workspace_edits(&Self::answer(rx, timer).await);
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.set_busy(None, cx);
+                if files.is_empty() {
+                    return window.push_notification(format!("Le plugin ne sait pas renommer « {old} » ici."), cx);
+                }
+                match this.apply_workspace_edit(&files, &sent, &client, window, cx) {
+                    Err(refused) => window.push_notification(Notification::error(format!("Renommage annulé, rien n'a changé : {}. Réessayez.", refused.join(", "))), cx),
+                    Ok((count, failed)) => {
+                        let note = format!("« {old} » → « {new} » : {count} modification{} dans {} fichier{}.", if count > 1 { "s" } else { "" }, files.len(), if files.len() > 1 { "s" } else { "" });
+                        match failed.is_empty() {
+                            true => window.push_notification(Notification::success(note), cx),
+                            false => window.push_notification(Notification::error(format!("{note} Impossible d'écrire : {}", failed.join(", "))), cx),
+                        }
+                    }
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// ⌘. : the language server's fixes and refactorings at the cursor, one to pick.
+    fn quick_fix(&mut self, _: &QuickFix, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((_, path, client, (line, col))) = self.symbol_at_cursor(window, cx) else { return };
+        let sent = Rc::new(self.sync_tabs_of(&path, &client, cx));
+        let (rx, timer) = (client.code_actions(&path, line, col), cx.background_executor().timer(Duration::from_secs(8)));
+        self.set_busy(Some("Corrections…"), cx);
+        cx.spawn_in(window, async move |this, cx| {
+            let answer = Self::answer(rx, timer).await;
+            // shortcut: actions that only run a server command (no edit to resolve) are left out; answer `workspace/applyEdit` if a server needs them.
+            let actions: Rc<Vec<serde_json::Value>> = Rc::new(answer.as_array().into_iter().flatten().filter(|a| a["disabled"].is_null() && (a["edit"].is_object() || !a["data"].is_null())).cloned().collect());
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.set_busy(None, cx);
+                if actions.is_empty() {
+                    return window.push_notification("Aucune correction proposée ici.", cx);
+                }
+                let ws = cx.entity().downgrade();
+                window.open_dialog(cx, move |dialog, _, _| {
+                    let rows = actions.iter().enumerate().map(|(i, action)| {
+                        let (ws, action, client, sent) = (ws.clone(), action.clone(), client.clone(), sent.clone());
+                        button(("quick-fix", i)).ghost().w_full().justify_start().label(action["title"].as_str().unwrap_or_default().to_string()).on_click(move |_, window, cx| {
+                            window.close_dialog(cx);
+                            let _ = ws.update(cx, |ws, cx| ws.run_code_action(action.clone(), client.clone(), sent.clone(), window, cx));
+                        })
+                    });
+                    dialog.title("Corrections rapides").child(v_flex().gap(r(2.)).children(rows))
+                });
+            });
+        })
+        .detach();
+    }
+
+    /// A chosen action's edit (asked for first if the server sends it only now), applied.
+    fn run_code_action(&mut self, action: serde_json::Value, client: Arc<lsp::Client>, sent: Rc<HashMap<PathBuf, String>>, window: &mut Window, cx: &mut Context<Self>) {
+        let rx = (!action["edit"].is_object()).then(|| client.resolve_action(&action));
+        let timer = cx.background_executor().timer(Duration::from_secs(8));
+        cx.spawn_in(window, async move |this, cx| {
+            let title = action["title"].as_str().unwrap_or_default().to_string();
+            let action = match rx {
+                Some(rx) => Self::answer(rx, timer).await,
+                None => action,
+            };
+            let files = completion::workspace_edits(&action["edit"]);
+            let _ = this.update_in(cx, |this, window, cx| {
+                if files.is_empty() {
+                    return window.push_notification(format!("« {title} » : le plugin n'a rien modifié."), cx);
+                }
+                match this.apply_workspace_edit(&files, &sent, &client, window, cx) {
+                    Err(refused) => window.push_notification(Notification::error(format!("Correction annulée, rien n'a changé : {}. Réessayez.", refused.join(", "))), cx),
+                    Ok((_, failed)) if !failed.is_empty() => window.push_notification(Notification::error(format!("« {title} » : impossible d'écrire {}", failed.join(", "))), cx),
+                    Ok(_) => {}
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// The server gets every open tab of `path`'s language as it is now, and we keep
+    /// that text: its edits are offsets in it (see `apply_workspace_edit`).
+    fn sync_tabs_of(&self, path: &Path, client: &lsp::Client, cx: &App) -> HashMap<PathBuf, String> {
         let mut sent: HashMap<PathBuf, String> = HashMap::new();
-        if let Some(lang) = self.buffers.iter().find(|b| b.path.as_ref() == Some(&path)).map(|b| b.lang)
+        if let Some(lang) = self.buffers.iter().find(|b| b.path.as_deref() == Some(path)).map(|b| b.lang)
             && let Some(server) = lang.server.as_ref()
         {
             for b in self.buffers.iter().filter(|b| b.lang.name == lang.name) {
@@ -1145,68 +1229,59 @@ impl Workspace {
                 }
             }
         }
-        let (rx, timer) = (client.rename(&path, line, col, &new), cx.background_executor().timer(Duration::from_secs(8)));
-        self.set_busy(Some("Renommage…"), cx);
-        cx.spawn_in(window, async move |this, cx| {
-            let files = completion::workspace_edits(&Self::answer(rx, timer).await);
-            let _ = this.update_in(cx, |this, window, cx| {
-                this.set_busy(None, cx);
-                if files.is_empty() {
-                    return window.push_notification(format!("Le plugin ne sait pas renommer « {old} » ici."), cx);
-                }
-                // All files checked first: renaming in some and not others would break the code.
-                let (mut plan, mut refused) = (vec![], vec![]);
-                for (file, edits) in &files {
-                    // An open tab changes like typed (⌘Z undoes it, ⌘S saves); other files are written.
-                    let buffer = this.buffers.iter().find(|b| b.path.as_ref() == Some(file));
-                    let editor = buffer.and_then(Buffer::editor).cloned();
-                    let src = match &editor {
-                        Some(editor) => editor.read(cx).value().to_string(),
-                        None => match fs::read_to_string(file) {
-                            Ok(src) => src,
-                            Err(_) => {
-                                refused.push(format!("{} (illisible)", file.display()));
-                                continue;
-                            }
-                        },
-                    };
-                    let stale = match sent.get(file) {
-                        Some(text) => *text != src,
-                        // Not sent now: the server has our last sync of it, or reads the disk
-                        // (then an unsaved tab differs from what it read).
-                        None => client.synced_text(file).map_or(buffer.is_some_and(|b| b.dirty), |t| t != src),
-                    };
-                    if stale {
-                        refused.push(format!("{} (modifié entre-temps)", file.display()));
+        sent
+    }
+
+    /// A language server's edits (rename, quick fix), in every file or none: a tab
+    /// typed in during the wait (its sync would hide the change) or a file changed
+    /// elsewhere refuses them all (Err: which ones). Ok: edits made, files not written.
+    fn apply_workspace_edit(&mut self, files: &[(PathBuf, Vec<completion::Edit>)], sent: &HashMap<PathBuf, String>, client: &lsp::Client, window: &mut Window, cx: &mut Context<Self>) -> Result<(usize, Vec<String>), Vec<String>> {
+        // All files checked first: edits in some and not others would break the code.
+        let (mut plan, mut refused) = (vec![], vec![]);
+        for (file, edits) in files {
+            // An open tab changes like typed (⌘Z undoes it, ⌘S saves); other files are written.
+            let buffer = self.buffers.iter().find(|b| b.path.as_ref() == Some(file));
+            let editor = buffer.and_then(Buffer::editor).cloned();
+            let src = match &editor {
+                Some(editor) => editor.read(cx).value().to_string(),
+                None => match fs::read_to_string(file) {
+                    Ok(src) => src,
+                    Err(_) => {
+                        refused.push(format!("{} (illisible)", file.display()));
                         continue;
                     }
-                    plan.push((file, src, editor, edits));
-                }
-                if !refused.is_empty() {
-                    return window.push_notification(Notification::error(format!("Renommage annulé, rien n'a changé : {}. Réessayez.", refused.join(", "))), cx);
-                }
-                let (mut count, mut failed) = (0, vec![]);
-                for (file, src, editor, edits) in plan {
-                    count += edits.len();
-                    let text = completion::apply_edits(&src, edits);
-                    match editor {
-                        Some(editor) => editor.update(cx, |e, cx| e.replace_text_in_range(Some(0..src.encode_utf16().count()), &text, window, cx)),
-                        None => {
-                            if write_file(file, &text).is_err() {
-                                failed.push(file.display().to_string());
-                            }
-                        }
+                },
+            };
+            let stale = match sent.get(file) {
+                Some(text) => *text != src,
+                // Not sent now: the server has our last sync of it, or reads the disk
+                // (then an unsaved tab differs from what it read).
+                None => client.synced_text(file).map_or(buffer.is_some_and(|b| b.dirty), |t| t != src),
+            };
+            if stale {
+                refused.push(format!("{} (modifié entre-temps)", file.display()));
+                continue;
+            }
+            plan.push((file, src, editor, edits));
+        }
+        if !refused.is_empty() {
+            return Err(refused);
+        }
+        let (mut count, mut failed) = (0, vec![]);
+        for (file, src, editor, edits) in plan {
+            count += edits.len();
+            let text = completion::apply_edits(&src, edits);
+            match editor {
+                Some(editor) => editor.update(cx, |e, cx| e.replace_text_in_range(Some(0..src.encode_utf16().count()), &text, window, cx)),
+                None => {
+                    if write_file(file, &text).is_err() {
+                        failed.push(file.display().to_string());
                     }
                 }
-                this.reload_from_disk(window, cx);
-                let note = format!("« {old} » → « {new} » : {count} modification{} dans {} fichier{}.", if count > 1 { "s" } else { "" }, files.len(), if files.len() > 1 { "s" } else { "" });
-                match failed.is_empty() {
-                    true => window.push_notification(Notification::success(note), cx),
-                    false => window.push_notification(Notification::error(format!("{note} Impossible d'écrire : {}", failed.join(", "))), cx),
-                }
-            });
-        })
-        .detach();
+            }
+        }
+        self.reload_from_disk(window, cx);
+        Ok((count, failed))
     }
 
     /// Git margin marks of a file's editor (added, modified, deleted lines), off the UI thread.
@@ -1922,10 +1997,6 @@ impl Workspace {
     }
 
     fn close_tab(&mut self, _: &CloseTab, window: &mut Window, cx: &mut Context<Self>) {
-        // A tool has no tab to close: ⌘W goes back to the files (the tool keeps its state).
-        if matches!(self.buffers.get(self.active).map(|b| &b.view), Some(View::Tool { .. })) {
-            return self.hide_tool(window, cx);
-        }
         self.close_buffer(self.active, window, cx);
     }
 
@@ -1937,7 +2008,7 @@ impl Workspace {
         self.cycle_tab(false, window, cx);
     }
 
-    /// The next (or previous) tab; from a tool, the first (or last) one.
+    /// The next (or previous) tab; from the welcome page, the first (or last) one.
     fn cycle_tab(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
         let tabs = self.tab_indices();
         let n = tabs.len();
@@ -2028,13 +2099,16 @@ impl Workspace {
 
     fn close_buffer(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(b) = self.buffers.get(ix) else { return };
-        if b.dirty && !confirm(&mut self.discard, Discard::Tab(b.id())) {
+        // Closing Claude's tab stops it (and what it runs): asked like an unsaved file.
+        let working = matches!(&b.view, View::Tool { id: "claude", view } if view.clone().downcast::<crate::tools::claude::ClaudeView>().is_ok_and(|c| c.read(cx).is_busy()));
+        if (b.dirty || working) && !confirm(&mut self.discard, Discard::Tab(b.id())) {
             let armed = self.discard;
             self.activate(ix, window, cx); // shows the tab, but must stay armed
             self.discard = armed;
-            return window.push_notification("Fichier non enregistré : ⌘S pour enregistrer, fermez à nouveau pour abandonner.", cx);
+            let why = if working { "Claude travaille : fermer l'onglet l'arrête. Fermez à nouveau pour l'arrêter." } else { "Fichier non enregistré : ⌘S pour enregistrer, fermez à nouveau pour abandonner." };
+            return window.push_notification(why, cx);
         }
-        // Its place in the tab bar (tools have no tab); a shrinking tab is a child
+        // Its place in the tab bar; a shrinking tab is a child
         // too: the ones after it are one further.
         let slot = self.tab_indices().iter().position(|&i| i == ix);
         let child = slot.map(|slot| if self.closing.as_ref().is_some_and(|c| slot >= c.at) { slot + 1 } else { slot });
@@ -2085,7 +2159,7 @@ impl Workspace {
             }
             return cx.notify();
         }
-        // The shown tab closed: its neighbour (not a tool, which has no tab), or the welcome page.
+        // The shown tab closed: its neighbour, or the welcome page.
         let tabs = self.tab_indices();
         match tabs.iter().find(|&&i| i >= ix).or(tabs.last()) {
             Some(&next) => self.activate(next, window, cx),
@@ -2827,8 +2901,7 @@ impl Workspace {
         let animations = AppSettings::get(cx).animations;
         let theme = cx.theme();
         let widths = self.tab_widths.clone();
-        // Tools have no tab: their icon in the activity bar shows them.
-        let mut tabs: Vec<AnyElement> = self.buffers.iter().enumerate().filter(|(_, b)| !matches!(b.view, View::Tool { .. })).map(|(ix, b)| {
+        let mut tabs: Vec<AnyElement> = self.buffers.iter().enumerate().map(|(ix, b)| {
                 let active = ix == self.active;
                 let group: SharedString = format!("tab-{ix}").into();
                 h_flex()
@@ -3408,6 +3481,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::go_to_definition))
             .on_action(cx.listener(Self::find_references))
             .on_action(cx.listener(Self::rename_symbol))
+            .on_action(cx.listener(Self::quick_fix))
             .on_action(cx.listener(Self::split_editor))
             .on_action(cx.listener(|this, _: &ZoomIn, _, cx| this.zoom(1., cx)))
             .on_action(cx.listener(|this, _: &ZoomOut, _, cx| this.zoom(-1., cx)))
@@ -3608,7 +3682,20 @@ mod tests {
     fn run_commands_expand_placeholders() {
         let cmd = expand_run("cc {file} -o {out} && {out}", Path::new("/p/it's main.c"), &HashMap::new());
         let out = shell_quote(&std::env::temp_dir().join("akolade-it's main").to_string_lossy());
-        assert_eq!(cmd, format!("cc '/p/it'\\''s main.c' -o {out} && {out}"));
+        let file = if cfg!(windows) { "'/p/it''s main.c'" } else { "'/p/it'\\''s main.c'" };
+        assert_eq!(cmd, format!("cc {file} -o {out} && {out}"));
+    }
+
+    #[test]
+    fn quotes_keep_a_name_one_word_in_the_terminal_shell() {
+        let quoted = shell_quote("l'outil; calc; '.py");
+        if cfg!(windows) {
+            assert_eq!(quoted, "'l''outil; calc; ''.py'"); // PowerShell: '' is a quote inside quotes
+        } else {
+            assert_eq!(quoted, "'l'\\''outil; calc; '\\''.py'");
+            let echoed = crate::platform::command("sh").arg("-c").arg(format!("printf %s {quoted}")).output().unwrap();
+            assert_eq!(String::from_utf8_lossy(&echoed.stdout), "l'outil; calc; '.py");
+        }
     }
 
     #[test]
@@ -3619,7 +3706,8 @@ mod tests {
             ("API_URL".to_string(), "http://x".to_string()),
         ]);
         let cmd = expand_run("node {file}", Path::new("/p/a.js"), &env);
-        assert_eq!(cmd, "export API_URL='http://x' NODE_ENV='dev; rm -rf ~'; node '/p/a.js'");
+        let expected = if cfg!(windows) { "$env:API_URL='http://x'; $env:NODE_ENV='dev; rm -rf ~'; node '/p/a.js'" } else { "export API_URL='http://x' NODE_ENV='dev; rm -rf ~'; node '/p/a.js'" };
+        assert_eq!(cmd, expected);
     }
 
     #[test]

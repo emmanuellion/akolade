@@ -129,6 +129,10 @@ struct UpdateFuture {
     tx_result: smol::channel::Sender<Result<ParsedContent, SharedString>>,
     delay: Duration,
     code_block_actions: Option<Arc<CodeBlockActionsFn>>,
+    /// akolade: a parse is due (the timer is set), for a throttle instead of a debounce.
+    due: bool,
+    /// akolade: how long the last parse took: a big document waits longer between parses.
+    last_parse: Duration,
 }
 
 impl UpdateFuture {
@@ -153,6 +157,8 @@ impl UpdateFuture {
             tx_result,
             delay,
             code_block_actions,
+            due: false,
+            last_parse: Duration::ZERO,
         }
     }
 }
@@ -175,9 +181,13 @@ impl Future for UpdateFuture {
                         }
                         _ => false,
                     };
-                    if changed {
-                        let delay = self.delay;
+                    // akolade: the timer was reset on every change, so a text that kept changing
+                    // (an answer streaming in) was parsed only once it paused: shown in jumps.
+                    // Now once per `delay` while it changes, the latest text each time.
+                    if changed && !self.due {
+                        let delay = self.delay.max(self.last_parse * 2);
                         self.timer.set_after(delay);
+                        self.due = true;
                     }
                     continue;
                 }
@@ -187,6 +197,8 @@ impl Future for UpdateFuture {
 
             match self.timer.poll_next(cx) {
                 Poll::Ready(Some(_)) => {
+                    self.due = false;
+                    let started = std::time::Instant::now();
                     let res = parse_content(
                         self.type_,
                         &self.current_text,
@@ -194,6 +206,7 @@ impl Future for UpdateFuture {
                         &self.highlight_theme,
                         &self.code_block_actions.clone(),
                     );
+                    self.last_parse = started.elapsed();
                     _ = self.tx_result.try_send(res);
                     continue;
                 }
@@ -625,7 +638,9 @@ impl Element for TextView {
                 highlight_theme,
                 rx,
                 tx_result,
-                Duration::from_millis(200),
+                // akolade: 30 ms (was 200): with the throttle above, a streamed answer
+                // shows ~30 times a second.
+                Duration::from_millis(30),
                 code_block_actions,
             ))
             .detach();

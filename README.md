@@ -41,7 +41,7 @@ Akolade dessine son interface sur la carte graphique avec [gpui](https://www.gpu
 
 - Coloration syntaxique par tree-sitter pour 35 langages, chacun avec sa propre couleur (Python en bleu, Rust en orange, JavaScript en jaune).
 - Complétion intégrée qui marche sans rien installer : elle apprend les mots du fichier et les classe selon le contexte (début d'instruction, expression, accès à un membre).
-- Complétion avancée, documentation au survol, aller à la définition (F12), références (⇧F12) et renommage (F2) avec les serveurs de langage installés depuis le Store.
+- Complétion avancée, documentation au survol, aller à la définition (F12), références (⇧F12), renommage (F2) et corrections rapides (⌘.) avec les serveurs de langage installés depuis le Store.
 - Formatage d'un raccourci (⌥⇧F), erreurs soulignées pendant la frappe.
 - Deux fichiers côte à côte (⌘\\), aperçu Markdown à côté du code, visionneuse d'images.
 - Bouton Exécuter (⌘R) pour lancer le fichier ouvert : 22 langages ont déjà leur commande.
@@ -66,14 +66,18 @@ Si [Claude Code](https://claude.com/code) est installé sur votre ordinateur, Ak
 
 - **Les réponses arrivent au fil de l'eau**, en Markdown.
 - **Chaque outil utilisé par Claude a sa carte** : la commande lancée, le fichier lu, le diff d'une modification. Un clic ouvre le fichier dans l'éditeur, et les onglets ouverts se rechargent dès que Claude modifie un fichier.
-- **Les autorisations se donnent dans la carte** : Autoriser ou Refuser. Quand Claude pose une question à choix multiples, ses options s'affichent en boutons.
+- **Chaque tour liste les fichiers modifiés** (commandes comprises) : un clic montre le diff, et chaque fichier se garde ou s'annule. Au survol d'un message, « Revenir avant ce message » remet les fichiers du projet comme ils étaient. Il faut un dépôt Git : les instantanés sont des objets Git, sans toucher à vos branches, à votre index ni à vos remises.
+- **Les autorisations se donnent dans la carte** : Autoriser, Refuser ou Toujours autoriser. Ce dernier dit ce qu'il retient (« Ne plus demander : Commande « git status * », dans ce projet ») et l'écrit dans le `.claude/settings.local.json` du projet, comme Claude Code. Quand Claude pose une question à choix multiples, ses options s'affichent en boutons.
+- **⏎ envoie, ⇧⏎ ou ⌘⏎ va à la ligne.** Pendant que Claude travaille, un nouveau message se met en file et part dès qu'il a fini ; Arrêter interrompt le tour.
+- **Images et longs textes** : une image collée part avec le message, un long texte collé devient une pièce jointe au lieu de remplir la zone de saisie.
+- **Les commandes `/`** : celles de Claude Code, de vos skills et de vos plugins, proposées dès qu'on tape `/`.
 - **Quatre modes** : Demander, Modifs auto, Plan et Tout autoriser (avec confirmation). On choisit aussi le modèle, l'effort et un budget maximum par session.
 - **Le suivi de la session** : coût estimé au tarif de l'API, tokens (entrée, sortie, cache), remplissage du contexte, limites de l'abonnement sur 5 heures et 7 jours, outils utilisés, fichiers modifiés.
 - **L'historique** : coût et tokens par jour, avec un graphique des 14 derniers jours.
 - **Les conversations passées** du projet, avec leur titre, leur date et leur coût. Un clic en reprend une.
 - **Le dossier de travail** est affiché en permanence, et on peut en choisir un autre que celui du projet.
 
-![Claude Code dans Akolade : une question, la lecture d'un fichier et la réponse, avec le suivi de la session à droite](docs/images/claude.png)
+![Claude Code dans Akolade après un tour : la réponse, les deux fichiers modifiés à garder ou annuler, et le suivi de la session à droite](docs/images/claude.png)
 
 ## Les outils
 
@@ -190,9 +194,11 @@ cargo run --release -- ~/mon-projet ~/mon-projet/src/main.rs
 
 **Facultatif :** Node.js pour les plugins installés avec npm, [Claude Code](https://claude.com/code) pour l'outil du même nom, Docker, kubectl, `gh` ou `glab` pour les outils correspondants. Chaque outil indique ce qui lui manque et comment l'installer.
 
-Les réglages sont rangés dans `~/Library/Application Support/Akolade`.
+Les réglages sont rangés dans `~/Library/Application Support/Akolade` sur macOS, `%APPDATA%\Akolade` sur Windows et `~/.local/share/akolade` sur Linux.
 
 ## Raccourcis clavier
+
+Sur Windows et Linux, ⌘ devient Ctrl et ⌥ devient Alt.
 
 | Action | Raccourci |
 |---|---|
@@ -212,13 +218,14 @@ Les réglages sont rangés dans `~/Library/Application Support/Akolade`.
 | Aller à la définition | F12 |
 | Trouver les références | ⇧F12 |
 | Renommer le symbole | F2 |
+| Corrections rapides | ⌘. |
 | Deux fichiers côte à côte | ⌘\\ |
 | Barre latérale | ⌘B |
 | Terminal | ⌃\` ou ⌘J |
 | Git | ⇧⌘G |
 | Paramètres | ⌘, |
 | Zoom | ⌘+, ⌘-, ⌘0 |
-| Envoyer à Claude | ⌘⏎ |
+| Envoyer à Claude | ⏎ (à la ligne : ⇧⏎ ou ⌘⏎) |
 
 ## Configurer un projet
 

@@ -93,6 +93,8 @@ pub struct AppSettings {
     pub claude_mode: String,
     /// Tell Claude which file is open.
     pub claude_with_file: bool,
+    /// The files a turn changed are kept at once (still listed, and undoable from a message).
+    pub claude_auto_keep: bool,
     /// Dollars a session may spend, 0: no limit.
     pub claude_budget: f64,
     /// Added to Claude's own instructions.
@@ -130,6 +132,7 @@ impl Default for AppSettings {
             claude_effort: String::new(),
             claude_mode: "manual".into(),
             claude_with_file: true,
+            claude_auto_keep: false,
             claude_budget: 0.,
             claude_instructions: String::new(),
             http_timeout: 60.,
@@ -427,6 +430,10 @@ impl Render for SettingsView {
                             .description("« Tout autoriser » : Claude agit sans rien demander, dès l'ouverture de l'outil."),
                     )
                     .item(SettingItem::new("Indiquer le fichier ouvert", switch(|s| s.claude_with_file, |s, v| s.claude_with_file = v)).description("Claude sait quel fichier vous regardez (désactivable message par message)."))
+                    .item(
+                        SettingItem::new("Toujours garder les modifications", switch(|s| s.claude_auto_keep, |s, v| s.claude_auto_keep = v))
+                            .description("Les fichiers modifiés par Claude sont gardés d'office à la fin de chaque tour. Leur liste et leur diff restent affichés, et « Revenir avant ce message » les annule toujours."),
+                    )
                     .item(
                         SettingItem::new("Budget maximum par session ($)", number(0., 1000., 0.5, |s| s.claude_budget, |s, v| s.claude_budget = v).default_value(d.claude_budget))
                             .description("Claude s'arrête une fois ce montant dépensé, au tarif de l'API. 0 : sans limite."),

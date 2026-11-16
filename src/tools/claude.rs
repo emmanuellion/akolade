@@ -10,27 +10,27 @@ use std::{
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
     process::{Child, ChildStdin, Stdio},
-    sync::Mutex,
+    sync::{Arc, Mutex},
     thread,
     time::{Duration, SystemTime},
 };
 
 use futures::{StreamExt, channel::mpsc};
 use gpui::{
-    AnyElement, AppContext, Context, Div, Entity, FontWeight, Hsla, ListAlignment, ListState, PromptLevel, list, InteractiveElement, IntoElement, ParentElement, Render, SharedString,
-    StatefulInteractiveElement, Styled, Subscription, Task, WeakEntity, Window, div, prelude::FluentBuilder, px, relative, rgb,
+    AnyElement, AppContext, ClipboardEntry, Context, Div, ElementId, EntityInputHandler, StyleRefinement, Entity, FontWeight, Hsla, ListAlignment, ListState, PromptLevel, list, InteractiveElement, IntoElement, ParentElement, Render, SharedString,
+    StatefulInteractiveElement, Styled, Subscription, Task, WeakEntity, Window, div, img, prelude::FluentBuilder, px, relative, rgb,
 };
 use gpui_component::{
     ActiveTheme, Disableable, Icon, IconName, Sizable,
     button::ButtonVariants,
     h_flex,
-    input::{Input, InputEvent, InputState},
+    input::{Enter, IndentInline, Input, InputEvent, InputState, Paste},
     spinner::Spinner,
-    text::TextView,
+    clipboard::Clipboard,
+    text::{TextView, TextViewStyle},
     tooltip::Tooltip,
     v_flex,
 };
-use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::{
@@ -55,289 +55,12 @@ const BYPASS: usize = 3;
 pub const EFFORTS: [(&str, &str); 6] = [("", "Par défaut"), ("low", "Faible"), ("medium", "Moyen"), ("high", "Élevé"), ("xhigh", "Très élevé"), ("max", "Maximum")];
 const SUGGESTIONS: [&str; 3] = ["Explique-moi l'architecture de ce projet", "Cherche des bugs dans le fichier ouvert", "Écris des tests pour le fichier ouvert"];
 
-// ---------------------------------------------------------------- protocol
+mod history;
+mod protocol;
+mod surface;
 
-/// Tokens and their price (estimated at the API's list price).
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct Usage {
-    pub input: u64,
-    pub output: u64,
-    pub cache_read: u64,
-    pub cache_write: u64,
-    pub cost: f64,
-}
-
-impl Usage {
-    fn add(&mut self, o: &Usage) {
-        self.input += o.input;
-        self.output += o.output;
-        self.cache_read += o.cache_read;
-        self.cache_write += o.cache_write;
-        self.cost += o.cost;
-    }
-
-    pub fn tokens(&self) -> u64 {
-        self.input + self.output + self.cache_read + self.cache_write
-    }
-}
-
-/// What a line of `claude -p --output-format stream-json` means here.
-#[derive(Debug, PartialEq)]
-pub enum Event {
-    Init { session: String, model: String, subscription: bool },
-    TextStart,
-    Text(String),
-    Thinking,
-    /// Tokens the model reads for this request: how full the context is.
-    Context(u64),
-    ToolUse { id: String, name: String, input: Value },
-    ToolResult { id: String, text: String, error: bool },
-    /// A permission request (`can_use_tool`), for the card of `tool_id`.
-    Ask { request: String, tool_id: String, tool: String, input: Value },
-    /// Another control request: answered "not supported" so the CLI never waits.
-    Unsupported { request: String },
-    /// End of a turn: per model, its usage since the last result and its context size.
-    Result { error: bool, text: String, secs: f64, models: Vec<(String, Usage, u64)> },
-    /// Subscription windows: name, part used (0–1), reset time (Unix seconds).
-    Limits(Vec<(&'static str, f64, i64)>),
-    Stderr(String),
-    Exit,
-}
-
-fn num(v: &Value) -> u64 {
-    v.as_u64().unwrap_or(0)
-}
-
-fn text_of(v: &Value) -> String {
-    v.as_str().unwrap_or_default().to_string()
-}
-
-/// A tool result's text: a string, or text blocks.
-fn result_text(content: &Value) -> String {
-    match content {
-        Value::String(s) => s.clone(),
-        Value::Array(blocks) => blocks.iter().filter_map(|b| b["text"].as_str()).collect::<Vec<_>>().join("\n"),
-        _ => String::new(),
-    }
-}
-
-pub fn parse(line: &str) -> Vec<Event> {
-    let Ok(v) = serde_json::from_str::<Value>(line) else { return vec![] };
-    // A sub-agent's own steps: only its summary (the Task card) shows.
-    let sub = !v["parent_tool_use_id"].is_null();
-    let blocks = |kind: &str| v["message"]["content"].as_array().into_iter().flatten().filter(|b| b["type"] == kind).cloned().collect::<Vec<_>>();
-    match v["type"].as_str().unwrap_or_default() {
-        "system" if v["subtype"] == "init" => {
-            vec![Event::Init { session: text_of(&v["session_id"]), model: text_of(&v["model"]), subscription: v["apiKeySource"] == "none" }]
-        }
-        "stream_event" if !sub => {
-            let e = &v["event"];
-            match e["type"].as_str().unwrap_or_default() {
-                "message_start" => {
-                    let u = &e["message"]["usage"];
-                    vec![Event::Context(num(&u["input_tokens"]) + num(&u["cache_read_input_tokens"]) + num(&u["cache_creation_input_tokens"]))]
-                }
-                "content_block_start" => match e["content_block"]["type"].as_str() {
-                    Some("text") => vec![Event::TextStart],
-                    Some("thinking") => vec![Event::Thinking],
-                    _ => vec![],
-                },
-                "content_block_delta" if e["delta"]["type"] == "text_delta" => vec![Event::Text(text_of(&e["delta"]["text"]))],
-                _ => vec![],
-            }
-        }
-        "assistant" if !sub => blocks("tool_use").into_iter().map(|b| Event::ToolUse { id: text_of(&b["id"]), name: text_of(&b["name"]), input: b["input"].clone() }).collect(),
-        "user" if !sub => blocks("tool_result")
-            .into_iter()
-            .map(|b| Event::ToolResult { id: text_of(&b["tool_use_id"]), text: result_text(&b["content"]), error: b["is_error"] == true })
-            .collect(),
-        "control_request" => {
-            let (request, req) = (text_of(&v["request_id"]), &v["request"]);
-            if req["subtype"] == "can_use_tool" {
-                vec![Event::Ask { request, tool_id: text_of(&req["tool_use_id"]), tool: text_of(&req["tool_name"]), input: req["input"].clone() }]
-            } else {
-                vec![Event::Unsupported { request }]
-            }
-        }
-        "result" => {
-            // shortcut: without `model_usage_since_last_result` (older CLIs) a turn counts nothing; upgrade by diffing `modelUsage`.
-            let models = v["model_usage_since_last_result"].as_object().into_iter().flatten().map(|(name, m)| {
-                let usage = Usage {
-                    input: num(&m["inputTokens"]),
-                    output: num(&m["outputTokens"]),
-                    cache_read: num(&m["cacheReadInputTokens"]),
-                    cache_write: num(&m["cacheCreationInputTokens"]),
-                    cost: m["costUSD"].as_f64().unwrap_or(0.),
-                };
-                (name.clone(), usage, num(&m["contextWindow"]))
-            });
-            let error = v["is_error"] == true || v["subtype"] != "success";
-            let text = match v["subtype"].as_str() {
-                Some("error_max_budget_usd") => "Budget maximum de la session atteint : Claude s'est arrêté (Paramètres › Outils).".into(),
-                Some("error_max_turns") => "Claude a atteint son nombre maximum d'étapes.".into(),
-                _ => v["result"].as_str().or(v["errors"][0].as_str()).map(str::to_string).unwrap_or_else(|| text_of(&v["subtype"])),
-            };
-            vec![Event::Result { error, text, secs: num(&v["duration_ms"]) as f64 / 1000., models: models.collect() }]
-        }
-        "rate_limit_event" => {
-            let w = &v["rate_limit_info"]["unifiedWindows"];
-            let limits = [("five_hour", "5 heures"), ("seven_day", "7 jours")]
-                .into_iter()
-                .filter_map(|(key, label)| Some((label, w[key]["utilization"].as_f64()?, w[key]["resetsAt"].as_i64().unwrap_or(0))))
-                .collect::<Vec<_>>();
-            if limits.is_empty() { vec![] } else { vec![Event::Limits(limits)] }
-        }
-        _ => vec![],
-    }
-}
-
-/// The file a tool writes, if it does.
-fn edited_file(name: &str, input: &Value) -> Option<PathBuf> {
-    matches!(name, "Edit" | "MultiEdit" | "Write" | "NotebookEdit").then(|| input["file_path"].as_str().or(input["notebook_path"].as_str()).map(PathBuf::from)).flatten()
-}
-
-fn label(name: &str) -> String {
-    match name {
-        "Bash" => "Commande".into(),
-        "Read" => "Lecture".into(),
-        "Edit" | "MultiEdit" => "Modification".into(),
-        "Write" => "Écriture".into(),
-        "NotebookEdit" => "Notebook".into(),
-        "Grep" => "Recherche".into(),
-        "Glob" => "Fichiers".into(),
-        "WebFetch" => "Page web".into(),
-        "WebSearch" => "Recherche web".into(),
-        "Task" | "Agent" => "Sous-agent".into(),
-        "TodoWrite" => "Tâches".into(),
-        "ExitPlanMode" => "Plan".into(),
-        "AskUserQuestion" => "Question".into(),
-        // MCP tools: `mcp__server__tool`.
-        _ => name.rsplit("__").next().unwrap_or(name).to_string(),
-    }
-}
-
-fn tool_icon(name: &str) -> Icon {
-    match name {
-        "Bash" => Icon::new(IconName::SquareTerminal),
-        "Read" => Icon::new(IconName::File),
-        "Edit" | "MultiEdit" | "Write" | "NotebookEdit" => Icon::empty().path("icons/pencil.svg"),
-        "Grep" | "Glob" => Icon::new(IconName::Search),
-        "WebFetch" | "WebSearch" => Icon::new(IconName::Globe),
-        "Task" | "Agent" => Icon::new(IconName::Bot),
-        "TodoWrite" | "ExitPlanMode" => Icon::empty().path("icons/list-todo.svg"),
-        "AskUserQuestion" => Icon::empty().path("icons/circle-help.svg"),
-        _ => Icon::empty().path("icons/wrench.svg"),
-    }
-}
-
-/// One line saying what a tool works on (paths relative to the project).
-pub fn summary(name: &str, input: &Value, root: &Path) -> String {
-    let rel = |p: &str| Path::new(p).strip_prefix(root).map_or_else(|_| p.to_string(), |p| p.display().to_string());
-    let s = |k: &str| input[k].as_str().unwrap_or_default();
-    let line = match name {
-        "Bash" => s("command").to_string(),
-        "Read" | "Edit" | "MultiEdit" | "Write" => rel(s("file_path")),
-        "NotebookEdit" => rel(s("notebook_path")),
-        "Grep" | "Glob" => match input["path"].as_str() {
-            Some(p) => format!("{} dans {}", s("pattern"), rel(p)),
-            None => s("pattern").to_string(),
-        },
-        "WebFetch" => s("url").to_string(),
-        "WebSearch" => s("query").to_string(),
-        "Task" | "Agent" => s("description").to_string(),
-        "TodoWrite" => {
-            let todos = input["todos"].as_array().map_or(&[][..], Vec::as_slice);
-            format!("{} terminées sur {}", todos.iter().filter(|t| t["status"] == "completed").count(), todos.len())
-        }
-        "ExitPlanMode" => "Plan prêt à relire".into(),
-        "AskUserQuestion" => text_of(&input["questions"][0]["question"]),
-        _ => input.as_object().and_then(|o| o.values().find_map(Value::as_str)).unwrap_or_default().to_string(),
-    };
-    line.lines().next().unwrap_or_default().to_string()
-}
-
-/// What a card shows unfolded: a diff for edits (`-`/`+`), the to-do list, the command, or the output.
-fn details(name: &str, input: &Value, result: Option<&str>) -> Vec<(char, String)> {
-    let lines = |prefix: char, text: &str| text.lines().map(|l| (prefix, l.to_string())).collect::<Vec<_>>();
-    let edit = |e: &Value| [lines('-', e["old_string"].as_str().unwrap_or_default()), lines('+', e["new_string"].as_str().unwrap_or_default())].concat();
-    match name {
-        "Edit" => edit(input),
-        "MultiEdit" => input["edits"].as_array().into_iter().flatten().flat_map(edit).collect(),
-        "Write" => lines('+', input["content"].as_str().unwrap_or_default()),
-        "TodoWrite" => input["todos"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .map(|t| {
-                let mark = match t["status"].as_str() {
-                    Some("completed") => '✓',
-                    Some("in_progress") => '›',
-                    _ => '·',
-                };
-                (mark, text_of(&t["content"]))
-            })
-            .collect(),
-        "Bash" if result.is_none() => lines('$', input["command"].as_str().unwrap_or_default()),
-        _ => lines(' ', result.unwrap_or_default()),
-    }
-}
-
-// ---------------------------------------------------------------- usage history
-
-/// Usage per day ("2026-11-15"), kept across sessions in Akolade's folder.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct History {
-    pub days: BTreeMap<String, Day>,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct Day {
-    pub usage: Usage,
-    pub turns: u32,
-    pub sessions: u32,
-}
-
-impl History {
-    fn path() -> PathBuf {
-        app_dir().join("claude-usage.json")
-    }
-
-    fn load() -> Self {
-        read_json(&Self::path())
-    }
-
-    fn save(&self) {
-        let _ = fs::create_dir_all(app_dir());
-        // Through a temporary file: a crash mid-write must not wipe the history.
-        if let Ok(text) = serde_json::to_string(self) {
-            let _ = crate::workspace::write_file(&Self::path(), &text);
-        }
-    }
-
-    pub fn record(&mut self, day: &str, usage: &Usage, turns: u32, sessions: u32) {
-        let d = self.days.entry(day.to_string()).or_default();
-        d.usage.add(usage);
-        d.turns += turns;
-        d.sessions += sessions;
-    }
-
-    /// Everything from `first` (a day) on.
-    pub fn since(&self, first: &str) -> Day {
-        let mut total = Day::default();
-        for d in self.days.range(first.to_string()..).map(|(_, d)| d) {
-            total.usage.add(&d.usage);
-            (total.turns, total.sessions) = (total.turns + d.turns, total.sessions + d.sessions);
-        }
-        total
-    }
-}
-
-fn day(days_ago: i64) -> String {
-    (chrono::Local::now() - chrono::Duration::days(days_ago)).format("%Y-%m-%d").to_string()
-}
+use history::*;
+use protocol::*;
 
 // ---------------------------------------------------------------- formats
 
@@ -386,7 +109,8 @@ impl Proc {
     /// `settings`: effort, budget and instructions from the "Outils" page.
     fn spawn(program: &Path, root: &Path, model: &str, mode: &str, resume: Option<&str>, settings: &AppSettings) -> std::io::Result<(Proc, mpsc::UnboundedReceiver<Event>)> {
         let mut cmd = crate::platform::command(program);
-        cmd.args(["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose", "--include-partial-messages"]);
+        // `--replay-user-messages`: a message sent while Claude works says when it is taken.
+        cmd.args(["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose", "--include-partial-messages", "--replay-user-messages"]);
         // Permission requests come to us on stdin/stdout (the cards' buttons).
         cmd.args(["--permission-prompt-tool", "stdio", "--permission-mode", mode]);
         if !model.is_empty() {
@@ -451,13 +175,51 @@ impl Drop for Proc {
 
 /// The answer to a permission request (`can_use_tool`), as `claude` waits for it
 /// on its stdin: allowed with the tool's input (a question's carries `answers`), or refused.
-fn permission_response(request: &str, allow: bool, input: &Value) -> Value {
+/// `rules`: Claude Code's suggestions, kept as "Toujours autoriser" (in the project's
+/// .claude/settings.local.json, as its own "don't ask again").
+fn permission_response(request: &str, allow: bool, input: &Value, rules: Option<&Value>) -> Value {
     let response = if allow {
-        json!({ "behavior": "allow", "updatedInput": input })
+        let mut r = json!({ "behavior": "allow", "updatedInput": input });
+        if let Some(rules) = rules {
+            r["updatedPermissions"] = rules.clone();
+        }
+        r
     } else {
         json!({ "behavior": "deny", "message": "L'utilisateur a refusé depuis Akolade." })
     };
     json!({ "type": "control_response", "response": { "subtype": "success", "request_id": request, "response": response } })
+}
+
+/// What "Toujours autoriser" keeps, in words ("Commande « git status », dans ce projet");
+/// None when Claude Code offers nothing to keep.
+fn always_text(rules: &Value) -> Option<String> {
+    let parts: Vec<String> = rules
+        .as_array()?
+        .iter()
+        .filter_map(|s| {
+            let what = match s["type"].as_str()? {
+                "addRules" => s["rules"]
+                    .as_array()?
+                    .iter()
+                    .map(|r| match r["ruleContent"].as_str() {
+                        Some(c) => format!("{} « {c} »", label(r["toolName"].as_str().unwrap_or_default())),
+                        None => label(r["toolName"].as_str().unwrap_or_default()),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                "setMode" if s["mode"] == "acceptEdits" => "les modifications de fichiers".into(),
+                "addDirectories" => format!("le dossier {}", s["directories"].as_array()?.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", ")),
+                _ => return None,
+            };
+            let place = match s["destination"].as_str() {
+                Some("session") => "pendant cette conversation",
+                Some("userSettings") => "dans tous vos projets",
+                _ => "dans ce projet",
+            };
+            Some(format!("{what}, {place}"))
+        })
+        .collect();
+    (!parts.is_empty()).then(|| format!("Ne plus demander : {}", parts.join(" ; ")))
 }
 
 /// `claude` in PATH, or where its installer puts it (apps opened from the Dock get a short PATH).
@@ -522,6 +284,8 @@ struct Scan {
     ai: Option<String>,
     first: Option<String>,
     cost: Option<f64>,
+    /// When the process that saved `cost` started (see `latest_totals`).
+    cost_start: u64,
 }
 
 impl Scan {
@@ -538,7 +302,8 @@ impl Scan {
         match kind {
             0 => self.custom = v["customTitle"].as_str().map(str::to_string).or(self.custom.take()),
             1 => self.ai = v["aiTitle"].as_str().map(str::to_string).or(self.ai.take()),
-            2 => self.cost = v["totalCostUSD"].as_f64().or(self.cost),
+            2 if num(&v["startTime"]) >= self.cost_start => (self.cost, self.cost_start) = (v["totalCostUSD"].as_f64().or(self.cost), num(&v["startTime"])),
+            2 => {}
             _ => self.first = prompt_of(&v).map(|p| split_file(&p).0),
         }
     }
@@ -611,11 +376,26 @@ pub fn list_past(root: &Path) -> Vec<Past> {
         .collect()
 }
 
-/// A saved conversation as cards: your messages, Claude's answers, its tools and their results.
-fn transcript(lines: impl Iterator<Item = String>) -> Vec<Item> {
-    let mut items = vec![];
-    for line in lines.filter(|l| l.contains("\"type\":\"user\"") || l.contains("\"type\":\"assistant\"")) {
+/// A saved conversation as cards (your messages, Claude's answers, its tools and their
+/// results) and its numbers for the side panel.
+///
+/// Each `claude` process saves its totals on exit (`cost-state`): the one started last
+/// took over the earlier ones' totals, so it holds the whole conversation. Without one
+/// (a crash), the answers' tokens are added up, at an unknown cost.
+fn transcript(lines: impl Iterator<Item = String>) -> (Vec<Item>, Stats) {
+    let (mut items, mut stats) = (vec![], Stats::default());
+    let (mut totals, mut totals_start) = (None::<Value>, 0);
+    // An answer's blocks come one per line, with the same id: counted once.
+    let (mut answers, mut seen) = (BTreeMap::<String, Usage>::new(), HashSet::new());
+    for line in lines.filter(|l| l.contains("\"type\":\"user\"") || l.contains("\"type\":\"assistant\"") || l.contains("\"type\":\"cost-state\"")) {
         let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
+        if v["type"] == "cost-state" {
+            if num(&v["startTime"]) >= totals_start {
+                totals_start = num(&v["startTime"]);
+                totals = Some(v);
+            }
+            continue;
+        }
         // Sub-agents' steps, and the notes Claude Code adds itself ("No response requested.").
         if v["isSidechain"] == true || v["message"]["model"] == "<synthetic>" {
             continue;
@@ -625,7 +405,9 @@ fn transcript(lines: impl Iterator<Item = String>) -> Vec<Item> {
             Some("user") => {
                 if let Some(p) = prompt_of(&v) {
                     let (text, file) = split_file(&p);
-                    items.push(Item::User(text, file));
+                    let images = blocks.iter().filter(|b| b["type"] == "image").map(|_| "Image".to_string()).collect();
+                    items.push(Item::User(text, file, images, None));
+                    stats.turns += 1;
                 }
                 for b in blocks.iter().filter(|b| b["type"] == "tool_result") {
                     let id = text_of(&b["tool_use_id"]);
@@ -639,10 +421,30 @@ fn transcript(lines: impl Iterator<Item = String>) -> Vec<Item> {
                 }
             }
             Some("assistant") => {
+                let m = &v["message"];
+                if m["id"].as_str().is_some_and(|id| seen.insert(id.to_string())) {
+                    let u = &m["usage"];
+                    let usage = Usage {
+                        input: num(&u["input_tokens"]),
+                        output: num(&u["output_tokens"]),
+                        cache_read: num(&u["cache_read_input_tokens"]),
+                        cache_write: num(&u["cache_creation_input_tokens"]),
+                        cost: 0.,
+                    };
+                    stats.context = usage.input + usage.cache_read + usage.cache_write;
+                    answers.entry(text_of(&m["model"])).or_default().add(&usage);
+                }
                 for b in blocks {
                     match b["type"].as_str() {
                         Some("text") => items.push(Item::Text(text_of(&b["text"]))),
-                        Some("tool_use") => items.push(Item::Tool { id: text_of(&b["id"]), name: text_of(&b["name"]), input: b["input"].clone(), result: None, ask: None }),
+                        Some("tool_use") => {
+                            let (name, input) = (text_of(&b["name"]), b["input"].clone());
+                            *stats.tools.entry(label(&name)).or_default() += 1;
+                            if let Some(f) = edited_file(&name, &input).filter(|f| !stats.files.contains(f)) {
+                                stats.files.push(f);
+                            }
+                            items.push(Item::Tool { id: text_of(&b["id"]), name, input, result: None, ask: None });
+                        }
                         _ => {}
                     }
                 }
@@ -650,7 +452,15 @@ fn transcript(lines: impl Iterator<Item = String>) -> Vec<Item> {
             _ => {}
         }
     }
-    items
+    stats.models = match &totals {
+        Some(t) => {
+            stats.secs = num(&t["totalAPIDuration"]) as f64 / 1000.;
+            t["modelUsage"].as_object().into_iter().flatten().map(|(name, m)| (name.clone(), model_usage(m))).collect()
+        }
+        None => answers,
+    };
+    stats.models.values().for_each(|u| stats.usage.add(u));
+    (items, stats)
 }
 
 /// "aujourd'hui à 14:32", "hier à 09:05", "12 nov. à 18:40", "3 mars 2025"
@@ -665,6 +475,90 @@ fn when(t: SystemTime) -> String {
         _ if t.year() == now.year() => format!("{} {} à {hour}", t.day(), MONTHS[t.month0() as usize]),
         _ => format!("{} {} {}", t.day(), MONTHS[t.month0() as usize], t.year()),
     }
+}
+
+/// Markdown from Claude, at a conversation's scale: gpui-component's headings are page
+/// titles (28 px for `#`), its code blocks unframed. Code blocks get a copy button.
+fn markdown(id: impl Into<ElementId>, text: String, window: &mut Window, cx: &mut gpui::App) -> TextView {
+    let theme = cx.theme();
+    let code = StyleRefinement::default().rounded(r(8.)).border_1().border_color(theme.border).px(r(14.)).py(r(11.)).text_size(r(12.5));
+    let style = TextViewStyle {
+        heading_base_font_size: window.rem_size() * (14.5 / 14.),
+        // The same theme as the parse below (`TextView::markdown` takes the app's): no second parse.
+        highlight_theme: theme.highlight_theme.clone(),
+        is_dark: theme.is_dark(),
+        ..TextViewStyle::default()
+    }
+    .paragraph_gap(gpui::rems(0.75))
+    .heading_font_size(|level, base| base * if level == 1 { 1.3 } else if level == 2 { 1.18 } else if level == 3 { 1.08 } else { 1. })
+    .code_block(code);
+    TextView::markdown(id, text, window, cx).style(style).selectable(true).code_block_actions(|block, _, _| Clipboard::new("copy").value(block.code()))
+}
+
+// ---------------------------------------------------------------- attachments
+
+/// Pasted in the box, sent with the next message.
+enum Attachment {
+    /// A long text: a chip, not hundreds of lines in the box.
+    Text(String),
+    /// An image as the API takes it: its media type and bytes, and a preview.
+    Image { media: &'static str, bytes: Vec<u8>, preview: Arc<gpui::Image> },
+}
+
+impl Attachment {
+    fn label(&self) -> String {
+        match self {
+            Attachment::Text(t) => format!("Texte collé, {} lignes", t.lines().count()),
+            Attachment::Image { .. } => "Image".into(),
+        }
+    }
+}
+
+/// `shown` moved `n` characters further in `text` (a byte index, on a character).
+fn reveal_to(text: &str, shown: usize, n: usize) -> usize {
+    let shown = shown.min(text.len());
+    text[shown..].char_indices().nth(n).map_or(text.len(), |(i, _)| shown + i)
+}
+
+/// Pasted text this long becomes an attachment.
+fn is_long(text: &str) -> bool {
+    text.lines().count() > 20 || text.len() > 3000
+}
+
+/// An image for the API: at most 1568 px on its longest side (Claude scales larger
+/// ones down anyway), as PNG, or JPEG when the PNG passes 3.5 MB (the API stops at 5 MB).
+fn for_claude(bytes: &[u8]) -> Option<(&'static str, Vec<u8>)> {
+    use std::io::Cursor;
+    let img = image::load_from_memory(bytes).ok()?;
+    let img = if img.width().max(img.height()) > 1568 { img.resize(1568, 1568, image::imageops::FilterType::Triangle) } else { img };
+    let mut png = vec![];
+    img.write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png).ok()?;
+    if png.len() <= 3_500_000 {
+        return Some(("image/png", png));
+    }
+    let mut jpeg = vec![];
+    img.to_rgb8().write_to(&mut Cursor::new(&mut jpeg), image::ImageFormat::Jpeg).ok()?;
+    Some(("image/jpeg", jpeg))
+}
+
+/// A message's content: the text with the pasted texts after it, images as blocks before.
+fn content(text: &str, attachments: &[Attachment]) -> Value {
+    use base64::Engine;
+    let images: Vec<Value> = attachments
+        .iter()
+        .filter_map(|a| match a {
+            Attachment::Image { media, bytes, .. } => Some(json!({ "type": "image", "source": { "type": "base64", "media_type": media, "data": base64::engine::general_purpose::STANDARD.encode(bytes) } })),
+            Attachment::Text(_) => None,
+        })
+        .collect();
+    if images.is_empty() {
+        return json!(text);
+    }
+    let mut blocks = images;
+    if !text.is_empty() {
+        blocks.push(json!({ "type": "text", "text": text }));
+    }
+    Value::Array(blocks)
 }
 
 // ---------------------------------------------------------------- view
@@ -694,13 +588,36 @@ impl ClaudeSettings {
 }
 
 enum Item {
-    /// What you asked, and the file it came with.
-    User(String, Option<String>),
+    /// What you asked, the file it came with, its attachments' names, and the project's
+    /// files as they were before it (a git snapshot, see `git::snapshot`).
+    User(String, Option<String>, Vec<String>, Option<String>),
     Text(String),
     /// `ask`: its permission request and your answer (None: waiting).
     Tool { id: String, name: String, input: Value, result: Option<(String, bool)>, ask: Option<(String, Option<bool>)> },
     Turn { secs: f64, usage: Usage },
+    /// The files a turn changed, between two snapshots: each to keep or undo.
+    Changes { before: String, after: String, files: Vec<Change> },
     Notice(String, bool),
+}
+
+struct Change {
+    status: char,
+    path: String,
+    /// Kept (true) or undone (false); None: not decided yet.
+    kept: Option<bool>,
+    /// Its diff, read when unfolded.
+    diff: Option<Vec<(char, String)>>,
+}
+
+/// A `git diff` as the cards' lines: the hunks only, their headers as a gap.
+fn diff_lines(diff: &str) -> Vec<(char, String)> {
+    diff.lines()
+        .skip_while(|l| !l.starts_with("@@"))
+        .map(|l| match l.chars().next() {
+            Some(c @ ('+' | '-' | ' ')) => (c, l[1..].to_string()),
+            _ => (' ', "⋯".to_string()),
+        })
+        .collect()
 }
 
 #[derive(Default)]
@@ -763,20 +680,52 @@ pub struct ClaudeView {
     relayout: bool,
     /// Back to the end at the next frame (a message sent, a conversation opened).
     to_bottom: bool,
+    /// Pasted images and long texts, for the next message.
+    attachments: Vec<Attachment>,
+    /// Claude Code's suggestions per waiting permission request (see `always_text`).
+    suggested: HashMap<String, Value>,
+    /// Sent while Claude works, not taken yet: our uuid, its card.
+    queued: Vec<(String, Item)>,
+    /// The answer appearing letter by letter: its card, the bytes shown.
+    reveal: Option<(usize, usize)>,
+    /// The letter-by-letter loop runs (`tick`).
+    ticking: bool,
+    _tick: Task<()>,
+    /// The mods' band above the box, their panes (id, title, drawing), status lines, last toast.
+    band: Option<Value>,
+    panes: Vec<(String, String, Option<Value>)>,
+    statuses: BTreeMap<String, String>,
+    toast: Option<(String, String)>,
+    _toast: Task<()>,
+    /// The project's files at the start of the running turn (a git snapshot).
+    base: Option<String>,
+    /// Messages typed while the first one waits for its snapshot: sent right after it.
+    held: Option<Vec<Value>>,
+    _snap: Task<()>,
+    /// Numbers our requests to the mods' engine.
+    ui_seq: u64,
+    /// The slash commands Claude Code knows (its own, skills, plugins'): kept from one
+    /// session to the next, so `/` suggests them before the first message too.
+    commands: Vec<(String, String, String)>,
     _reader: Task<()>,
     _subs: Vec<Subscription>,
 }
 
 impl ClaudeView {
     pub fn new(workspace: WeakEntity<Workspace>, root: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let input = cx.new(|cx| InputState::new(window, cx).multi_line(true).auto_grow(2, 10).placeholder("Demandez quelque chose à Claude… (⌘⏎ pour envoyer)"));
+        let input = cx.new(|cx| InputState::new(window, cx).multi_line(true).auto_grow(2, 10).placeholder("Demandez quelque chose à Claude…"));
         let subs = vec![
-            cx.subscribe_in(&input, window, |this, _, ev, window, cx| {
-                if let InputEvent::PressEnter { secondary: true } = ev {
-                    this.send_input(window, cx);
+            cx.observe_global::<AppSettings>(|this, cx| this.apply_settings(cx)),
+            // The `/` suggestions follow what is typed. A first `/`: `claude` starts (no
+            // message sent) to say which commands this folder has (`Event::Commands`).
+            cx.subscribe_in(&input, window, |this, input, e: &InputEvent, window, cx| {
+                if matches!(e, InputEvent::Change) {
+                    if input.read(cx).value() == "/" && this.proc.is_none() && this.root.as_deref().is_some_and(crate::trust::is_trusted) {
+                        this.start(window, cx);
+                    }
+                    cx.notify();
                 }
             }),
-            cx.observe_global::<AppSettings>(|this, cx| this.apply_settings(cx)),
         ];
         let mut view = Self {
             workspace,
@@ -812,12 +761,33 @@ impl ClaudeView {
             log: ListState::new(0, ListAlignment::Bottom, px(800.)),
             relayout: false,
             to_bottom: false,
+            attachments: vec![],
+            suggested: HashMap::new(),
+            queued: vec![],
+            reveal: None,
+            ticking: false,
+            _tick: Task::ready(()),
+            band: None,
+            panes: vec![],
+            statuses: BTreeMap::new(),
+            toast: None,
+            _toast: Task::ready(()),
+            ui_seq: 0,
+            base: None,
+            held: None,
+            _snap: Task::ready(()),
+            commands: read_json(&app_dir().join("claude-commands.json")),
             _reader: Task::ready(()),
             _subs: subs,
         };
         view.project = view.root.clone();
         view.apply_settings(cx);
         view
+    }
+
+    /// Claude is answering or running a tool.
+    pub fn is_busy(&self) -> bool {
+        self.busy
     }
 
     /// The defaults chosen in the settings; `claude` restarts on the same conversation to apply them.
@@ -938,6 +908,79 @@ impl ClaudeView {
         self.items.iter().position(|i| matches!(i, Item::Tool { name, ask: Some((_, None)), .. } if name == "AskUserQuestion"))
     }
 
+    /// ⏎ sends; ⌘⏎ (and ⇧⏎, bound in main.rs) goes to the line, as the box does by itself.
+    /// While an accent or a Japanese word is being composed, ⏎ is the input method's.
+    fn enter(&mut self, action: &Enter, window: &mut Window, cx: &mut Context<Self>) {
+        if action.secondary || self.input.update(cx, |i, cx| i.marked_text_range(window, cx)).is_some() {
+            return;
+        }
+        cx.stop_propagation();
+        // A `/` half typed: ⏎ completes it, as in the terminal; a whole command is sent.
+        let typed = self.input.read(cx).value().trim_start_matches('/').to_string();
+        let found = self.suggestions(cx);
+        if let Some(first) = found.first().filter(|_| !found.iter().any(|c| c.0 == typed)).map(|c| c.0.clone()) {
+            return self.complete(&first, window, cx);
+        }
+        self.send_input(window, cx);
+    }
+
+    /// The commands matching a `/` being typed (the box holds `/` and a word, nothing else).
+    fn suggestions(&self, cx: &gpui::App) -> Vec<&(String, String, String)> {
+        let text = self.input.read(cx).value();
+        let Some(word) = text.strip_prefix('/').filter(|w| !w.contains(char::is_whitespace)) else { return vec![] };
+        let word = word.to_lowercase();
+        // In the order of `Event::Commands`: yours, the plugins', Claude Code's.
+        self.commands.iter().filter(|c| c.0.to_lowercase().contains(&word)).collect()
+    }
+
+    fn complete(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let text = format!("/{name} ");
+        self.input.update(cx, |i, cx| {
+            i.set_value(text, window, cx);
+            i.focus(window, cx);
+        });
+    }
+
+    /// ⇥ on a `/` being typed: the first command it matches.
+    fn tab(&mut self, _: &IndentInline, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(name) = self.suggestions(cx).first().map(|c| c.0.clone()) else { return };
+        cx.stop_propagation();
+        self.complete(&name, window, cx);
+    }
+
+    /// ⌘V in the box: an image or a long text becomes an attachment, a short text goes in as usual.
+    fn paste(&mut self, _: &Paste, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(item) = cx.read_from_clipboard() else { return };
+        let image = item.entries().iter().find_map(|e| match e {
+            ClipboardEntry::Image(i) => Some(i.bytes().to_vec()),
+            _ => None,
+        });
+        if let Some(bytes) = image {
+            cx.stop_propagation();
+            // Decoding and scaling a Retina screenshot takes a moment: off the UI thread.
+            let task = cx.background_executor().spawn(async move { for_claude(&bytes) });
+            cx.spawn(async move |this, cx| {
+                let image = task.await;
+                let _ = this.update(cx, |this, cx| {
+                    match image {
+                        Some((media, bytes)) => {
+                            let format = if media == "image/png" { gpui::ImageFormat::Png } else { gpui::ImageFormat::Jpeg };
+                            let preview = Arc::new(gpui::Image::from_bytes(format, bytes.clone()));
+                            this.attachments.push(Attachment::Image { media, bytes, preview });
+                        }
+                        None => this.items.push(Item::Notice("Cette image ne peut pas être envoyée à Claude (format non reconnu).".into(), true)),
+                    }
+                    cx.notify();
+                });
+            })
+            .detach();
+        } else if let Some(text) = item.text().filter(|t| is_long(t)) {
+            cx.stop_propagation();
+            self.attachments.push(Attachment::Text(text));
+            cx.notify();
+        }
+    }
+
     fn send_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let text = self.input.read(cx).value().trim().to_string();
         // Typed while Claude asks: the answer, in your own words.
@@ -945,56 +988,249 @@ impl ClaudeView {
             self.input.update(cx, |i, cx| i.set_value("", window, cx));
             return self.reply(ix, Some(text), cx);
         }
-        if !text.is_empty() && !self.busy {
+        // While Claude works it waits in line ("Mettre en file", see `send`).
+        if !text.is_empty() || !self.attachments.is_empty() {
             self.input.update(cx, |i, cx| i.set_value("", window, cx));
             self.send(text, window, cx);
         }
     }
 
+    /// While Claude works the message waits in line, as in the terminal: Claude takes
+    /// it at its next step (with a command's result) or once it has answered.
     fn send(&mut self, text: String, window: &mut Window, cx: &mut Context<Self>) {
-        let (Some(program), Some(root)) = (self.program.clone(), self.root.clone()) else { return };
-        if self.busy {
-            return;
-        }
+        let (Some(_), Some(root)) = (self.program.as_ref(), self.root.clone()) else { return };
         // In -p mode Claude Code asks nothing: it runs the project's hooks (.claude/settings.json) at once.
         if self.proc.is_none() && !crate::trust::is_trusted(&root) {
             return self.ask_trust(text, root, window, cx);
         }
-        if self.proc.is_none() {
-            let settings = AppSettings::get(cx).clone();
-            match Proc::spawn(&program, &root, MODELS[self.model].1, MODES[self.mode].1, self.session.as_deref(), &settings) {
-                Ok((proc, mut rx)) => {
-                    self.proc = Some(proc);
-                    self.stderr.clear();
-                    self._reader = cx.spawn_in(window, async move |this, cx| {
-                        while let Some(e) = rx.next().await {
-                            if this.update_in(cx, |this, window, cx| this.apply(e, window, cx)).is_err() {
-                                break;
-                            }
-                        }
-                    });
-                }
-                Err(e) => {
-                    self.items.push(Item::Notice(format!("Impossible de lancer Claude Code : {e}"), true));
-                    return cx.notify();
-                }
-            }
+        if self.proc.is_none() && !self.start(window, cx) {
+            return cx.notify();
         }
         let file = self.with_file.then(|| self.last_file(cx)).flatten().map(|p| self.rel(&p));
-        let prompt = match &file {
-            Some(f) => format!("{text}\n\n(Fichier ouvert dans l'éditeur : {f})"),
-            None => text.clone(),
-        };
-        let sent = self.proc.as_mut().is_some_and(|p| p.send(json!({ "type": "user", "message": { "role": "user", "content": prompt } })));
-        self.items.push(Item::User(text, file));
-        if sent {
-            (self.busy, self.thinking) = (true, true);
-        } else {
-            self.proc = None;
-            self.items.push(Item::Notice("Claude Code ne répond plus : renvoyez votre message pour le relancer.".into(), true));
+        let attachments = std::mem::take(&mut self.attachments);
+        // The pasted texts after yours; the open file last (`split_file` finds it there).
+        let pasted = attachments.iter().filter_map(|a| match a {
+            Attachment::Text(t) => Some(t.as_str()),
+            Attachment::Image { .. } => None,
+        });
+        let mut prompt = std::iter::once(text.as_str()).chain(pasted).filter(|t| !t.is_empty()).collect::<Vec<_>>().join("\n\n");
+        if let Some(f) = &file {
+            prompt = format!("{prompt}\n\n(Fichier ouvert dans l'éditeur : {f})");
         }
+        let uuid = crate::tools::devtools::uuid_v4();
+        let message = json!({ "type": "user", "uuid": uuid, "message": { "role": "user", "content": content(&prompt, &attachments) } });
+        let short: String = text.chars().take(80).collect();
+        let card = Item::User(text, file, attachments.iter().map(Attachment::label).collect(), None);
         self.to_bottom = true;
+        if self.busy {
+            // The first message still waits for its snapshot: this one goes after it.
+            if let Some(held) = &mut self.held {
+                held.push(message);
+                self.queued.push((uuid, card));
+            } else if self.proc.as_mut().is_some_and(|p| p.send(message)) {
+                self.queued.push((uuid, card));
+            } else {
+                self.items.push(card);
+                self.lost();
+            }
+            return cx.notify();
+        }
+        self.items.push(card);
+        (self.busy, self.thinking, self.held) = (true, true, Some(vec![]));
+        // The files as they are before Claude reads it (to undo its turn): then it goes.
+        let (ix, root) = (self.items.len() - 1, self.root.clone());
+        let snap = cx.background_executor().spawn(async move { root.and_then(|r| crate::git::snapshot(&r).ok()) });
+        self._snap = cx.spawn(async move |this, cx| {
+            let tree = snap.await;
+            let _ = this.update(cx, |this, cx| {
+                if !this.busy {
+                    // Stopped before it left: said, as for the messages in line (`end_turn`).
+                    this.items.push(Item::Notice(format!("Non envoyé (arrêté avant l'envoi) : « {short} »"), true));
+                    return cx.notify();
+                }
+                if let Some(Item::User(.., before)) = this.items.get_mut(ix) {
+                    before.clone_from(&tree);
+                }
+                this.base = tree;
+                // Then the messages typed meanwhile, in order.
+                let held = this.held.take().unwrap_or_default();
+                if !std::iter::once(message).chain(held).all(|m| this.proc.as_mut().is_some_and(|p| p.send(m))) {
+                    this.lost();
+                }
+                cx.notify();
+            });
+        });
         cx.notify();
+    }
+
+    /// `claude` stopped answering: the turn ends (messages in line said as not sent).
+    fn lost(&mut self) {
+        self.proc = None;
+        self.end_turn();
+        self.items.push(Item::Notice("Claude Code ne répond plus : renvoyez votre message pour le relancer.".into(), true));
+    }
+
+    /// At the end of a turn: the files it changed, listed to keep or undo.
+    fn review(&mut self, cx: &mut Context<Self>) {
+        let (Some(before), Some(root)) = (self.base.clone(), self.root.clone()) else { return };
+        let session = self.session.clone();
+        let task = cx.background_executor().spawn(async move {
+            let after = crate::git::snapshot(&root).ok()?;
+            let files = crate::git::changed(&root, &before, &after).ok()?;
+            Some((before, after, files))
+        });
+        cx.spawn(async move |this, cx| {
+            let Some((before, after, files)) = task.await else { return };
+            let _ = this.update(cx, |this, cx| {
+                // Messages in line go on from here (a new message takes its own snapshot).
+                if this.base.as_ref() == Some(&before) {
+                    this.base = Some(after.clone());
+                }
+                if !files.is_empty() && this.session == session {
+                    // "Toujours garder" (settings): decided at once, nothing left to click.
+                    let kept = AppSettings::get(cx).claude_auto_keep.then_some(true);
+                    let files = files.into_iter().map(|(status, path)| Change { status, path, kept, diff: None }).collect();
+                    this.items.push(Item::Changes { before, after, files });
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Undoes one file of a turn's changes, or all those not kept (`path` None).
+    fn undo(&mut self, ix: usize, path: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
+        let (Some(Item::Changes { before, files, .. }), Some(root)) = (self.items.get(ix), self.root.clone()) else { return };
+        let picked: Vec<(char, String)> = files.iter().filter(|f| f.kept.is_none() && path.as_ref().is_none_or(|p| *p == f.path)).map(|f| (f.status, f.path.clone())).collect();
+        let (before, session) = (before.clone(), self.session.clone());
+        let task = cx.background_executor().spawn(async move { crate::git::restore(&root, &before, &picked).map(|_| picked) });
+        cx.spawn_in(window, async move |this, cx| {
+            let done = task.await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                match done {
+                    Ok(picked) => {
+                        // Card `ix` of this conversation (another one may be shown by now).
+                        if let Some(Item::Changes { files, .. }) = this.items.get_mut(ix).filter(|_| this.session == session) {
+                            for f in files.iter_mut().filter(|f| picked.iter().any(|p| p.1 == f.path)) {
+                                f.kept = Some(false);
+                            }
+                        }
+                        this.reload(window, cx);
+                    }
+                    Err(e) => this.items.push(Item::Notice(format!("Impossible d'annuler : {e}"), true)),
+                }
+                (this.relayout, this.to_bottom) = (true, false);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Back to the files as they were before message `ix` (Claude's changes since, and yours).
+    fn rewind(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let (Some(Item::User(_, _, _, Some(before))), Some(root)) = (self.items.get(ix), self.root.clone()) else { return };
+        let (before, session) = (before.clone(), self.session.clone());
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            "Revenir avant ce message ?",
+            Some("Les fichiers du projet reprennent leur contenu d'avant ce message : les modifications faites depuis (par Claude et par vous) sont perdues. La conversation, elle, continue."),
+            &["Revenir", "Annuler"],
+            cx,
+        );
+        cx.spawn_in(window, async move |this, cx| {
+            if answer.await != Ok(0) {
+                return;
+            }
+            let done = cx
+                .background_executor()
+                .spawn(async move {
+                    let now = crate::git::snapshot(&root)?;
+                    let files = crate::git::changed(&root, &before, &now)?;
+                    crate::git::restore(&root, &before, &files).map(|_| files.len())
+                })
+                .await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                let text = match done {
+                    Ok(n) => {
+                        // The changes listed after it are undone too (if this conversation is still shown).
+                        let from = if this.session == session { ix } else { this.items.len() };
+                        for item in &mut this.items[from..] {
+                            if let Item::Changes { files, .. } = item {
+                                files.iter_mut().filter(|f| f.kept.is_none()).for_each(|f| f.kept = Some(false));
+                            }
+                        }
+                        this.reload(window, cx);
+                        Item::Notice(format!("Fichiers remis comme avant ce message ({n} {}).", if n > 1 { "fichiers" } else { "fichier" }), false)
+                    }
+                    Err(e) => Item::Notice(format!("Impossible de revenir avant ce message : {e}"), true),
+                };
+                this.items.push(text);
+                (this.relayout, this.to_bottom) = (true, true);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn reload(&self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(ws) = self.workspace.upgrade() {
+            ws.update(cx, |ws, cx| ws.reload_from_disk(window, cx));
+        }
+    }
+
+    /// Marks one file of a turn's changes as kept, or all those not decided (`path` None).
+    fn keep(&mut self, ix: usize, path: Option<String>, cx: &mut Context<Self>) {
+        if let Some(Item::Changes { files, .. }) = self.items.get_mut(ix) {
+            for f in files.iter_mut().filter(|f| f.kept.is_none() && path.as_ref().is_none_or(|p| *p == f.path)) {
+                f.kept = Some(true);
+            }
+            self.relayout = true;
+            cx.notify();
+        }
+    }
+
+    /// Shows (or hides) one changed file's diff.
+    fn toggle_diff(&mut self, ix: usize, path: &str, cx: &mut Context<Self>) {
+        let root = self.root.clone().unwrap_or_default();
+        if let Some(Item::Changes { before, after, files }) = self.items.get_mut(ix)
+            && let Some(f) = files.iter_mut().find(|f| f.path == path)
+        {
+            f.diff = match f.diff {
+                Some(_) => None,
+                None => Some(diff_lines(&crate::git::tree_diff(&root, before, after, path))),
+            };
+            self.relayout = true;
+            cx.notify();
+        }
+    }
+
+    /// Starts `claude` (in a trusted folder): false if it could not, said in a card.
+    fn start(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let (Some(program), Some(root)) = (self.program.clone(), self.root.clone()) else { return false };
+        let settings = AppSettings::get(cx).clone();
+        match Proc::spawn(&program, &root, MODELS[self.model].1, MODES[self.mode].1, self.session.as_deref(), &settings) {
+            Ok((mut proc, mut rx)) => {
+                // The mods draw here as on Claude Code's desktop app (see `surface`).
+                proc.send(surface::attach());
+                // Its slash commands, with their descriptions (for `/`).
+                proc.send(json!({ "type": "control_request", "request_id": "akolade-init", "request": { "subtype": "initialize" } }));
+                self.proc = Some(proc);
+                self.redraw_mods();
+                self.stderr.clear();
+                self._reader = cx.spawn_in(window, async move |this, cx| {
+                    while let Some(e) = rx.next().await {
+                        if this.update_in(cx, |this, window, cx| this.apply(e, window, cx)).is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+            Err(e) => {
+                self.items.push(Item::Notice(format!("Impossible de lancer Claude Code : {e}"), true));
+                return false;
+            }
+        }
+        true
     }
 
     /// Before Claude's first start in a folder not trusted yet: yes is remembered
@@ -1034,20 +1270,75 @@ impl ClaudeView {
                 (self.session, self.model_name, self.subscription) = (Some(session), model, subscription);
             }
             Event::TextStart => {
-                self.thinking = false;
+                (self.busy, self.thinking) = (true, false);
                 self.items.push(Item::Text(String::new()));
+                self.reveal = Some((self.items.len() - 1, 0));
             }
             Event::Text(t) => {
                 self.thinking = false;
                 match self.items.last_mut() {
                     Some(Item::Text(s)) => s.push_str(&t),
-                    _ => self.items.push(Item::Text(t)),
+                    _ => {
+                        self.items.push(Item::Text(t));
+                        self.reveal = Some((self.items.len() - 1, 0));
+                    }
+                }
+                self.tick(cx);
+            }
+            // Claude at work, also on a turn a mod started (its band's "Review").
+            Event::Thinking => (self.busy, self.thinking) = (true, true),
+            Event::Context(n) => (self.stats.context, self.busy) = (n, true),
+            Event::Taken(uuid) => {
+                if let Some(i) = self.queued.iter().position(|(u, _)| *u == uuid) {
+                    let (_, card) = self.queued.remove(i);
+                    self.items.push(card);
+                    (self.busy, self.thinking, self.to_bottom) = (true, true, true);
                 }
             }
-            Event::Thinking => self.thinking = true,
-            Event::Context(n) => self.stats.context = n,
+            Event::Drawn { request, tree } => {
+                if request.starts_with("ui-band-") {
+                    self.band = Some(tree);
+                } else if let Some(pane) = request.strip_prefix("ui-pane-").and_then(|r| r.rsplit_once('-')).map(|(id, _)| id.to_string()) {
+                    if let Some(p) = self.panes.iter_mut().find(|p| p.0 == pane) {
+                        p.2 = Some(tree);
+                    }
+                }
+            }
+            Event::Redraw => self.redraw_mods(),
+            Event::Commands(c) => {
+                // Kept on disk: `/` suggests them before `claude` starts, after a restart too.
+                if let Ok(text) = serde_json::to_string(&c) {
+                    let _ = fs::create_dir_all(app_dir());
+                    let _ = crate::workspace::write_file(&app_dir().join("claude-commands.json"), &text);
+                }
+                self.commands = c;
+            }
+            Event::Panes(panes) => {
+                let old = std::mem::take(&mut self.panes);
+                self.panes = panes.into_iter().map(|(id, title)| {
+                    let tree = old.iter().find(|p| p.0 == id).and_then(|p| p.2.clone());
+                    (id, title, tree)
+                }).collect();
+                self.redraw_mods();
+            }
+            Event::Toast(plugin, text, ms) => {
+                self.toast = Some((plugin, text));
+                // At most 8 s: a toast is a passing word.
+                let wait = Duration::from_millis(ms.clamp(1500, 8000));
+                self._toast = cx.spawn(async move |this, cx| {
+                    cx.background_executor().timer(wait).await;
+                    let _ = this.update(cx, |this, cx| {
+                        this.toast = None;
+                        cx.notify();
+                    });
+                });
+            }
+            Event::Status(plugin, text) => match text {
+                Some(t) => _ = self.statuses.insert(plugin, t),
+                None => _ = self.statuses.remove(&plugin),
+            },
             Event::ToolUse { id, name, input } => {
-                self.thinking = true;
+                (self.busy, self.thinking) = (true, true);
                 *self.stats.tools.entry(label(&name)).or_default() += 1;
                 if let Some(f) = edited_file(&name, &input).filter(|f| !self.stats.files.contains(f)) {
                     self.stats.files.push(f);
@@ -1071,7 +1362,10 @@ impl ClaudeView {
                     ws.update(cx, |ws, cx| ws.reload_from_disk(window, cx));
                 }
             }
-            Event::Ask { request, tool_id, tool, input } => {
+            Event::Ask { request, tool_id, tool, input, rules } => {
+                if always_text(&rules).is_some() {
+                    self.suggested.insert(request.clone(), rules);
+                }
                 self.thinking = false;
                 // On its tool's card; a card of its own if that one is not there yet.
                 let card = self.items.iter_mut().find_map(|i| match i {
@@ -1099,7 +1393,9 @@ impl ClaudeView {
                 (self.stats.turns, self.stats.secs) = (self.stats.turns + 1, self.stats.secs + secs);
                 self.history.record(&day(0), &turn, 1, 0);
                 self.history.save();
-                (self.busy, self.thinking) = (false, false);
+                // Messages still in line: Claude answers them next.
+                let more = !self.queued.is_empty();
+                (self.busy, self.thinking) = (more, more);
                 if std::mem::take(&mut self.restart) {
                     self.proc = None;
                 }
@@ -1110,6 +1406,7 @@ impl ClaudeView {
                 if turn.tokens() > 0 {
                     self.items.push(Item::Turn { secs, usage: turn });
                 }
+                self.review(cx);
             }
             Event::Limits(l) => self.limits = l,
             Event::Stderr(line) => {
@@ -1156,7 +1453,13 @@ impl ClaudeView {
 
     /// Nothing runs any more: pending tools and questions are closed.
     fn end_turn(&mut self) {
-        (self.busy, self.thinking) = (false, false);
+        (self.busy, self.thinking, self.held) = (false, false, None);
+        // Claude stopped before taking them: said, not silently dropped.
+        for (_, card) in std::mem::take(&mut self.queued) {
+            if let Item::User(text, ..) = card {
+                self.items.push(Item::Notice(format!("Non envoyé (Claude s'est arrêté avant) : « {} »", text.chars().take(80).collect::<String>()), true));
+            }
+        }
         self.relayout = true;
         for item in &mut self.items {
             match item {
@@ -1173,14 +1476,21 @@ impl ClaudeView {
         }
     }
 
-    fn answer(&mut self, ix: usize, allow: bool, cx: &mut Context<Self>) {
+    /// `always`: allowed, and Claude Code keeps its suggested rule so as not to ask again.
+    fn answer(&mut self, ix: usize, allow: bool, always: bool, cx: &mut Context<Self>) {
         // (The message itself: `permission_response`.)
         let Some(Item::Tool { name, input, ask: Some((request, answer @ None)), .. }) = self.items.get_mut(ix) else { return };
         // A plan approved is a plan to apply: as in Claude Code, out of plan mode (from the next message).
         if allow && name == "ExitPlanMode" && MODES[self.mode].1 == "plan" {
             (self.mode, self.restart) = (0, true);
         }
-        let msg = permission_response(request, allow, input);
+        let rules = self.suggested.remove(request.as_str()).filter(|_| allow && always);
+        // "Accept edits" kept: Claude Code is in that mode now, the selector says so.
+        let mode = rules.as_ref().and_then(|r| r.as_array()?.iter().find(|s| s["type"] == "setMode")?["mode"].as_str().map(str::to_string));
+        if let Some(m) = mode.and_then(|m| MODES.iter().position(|(_, v, _)| *v == m)) {
+            self.mode = m;
+        }
+        let msg = permission_response(request, allow, input, rules.as_ref());
         *answer = Some(allow);
         self.relayout = true;
         if let Some(p) = &mut self.proc {
@@ -1220,7 +1530,80 @@ impl ClaudeView {
             answers.insert(text_of(&question["question"]), answer.into());
         }
         input["answers"] = Value::Object(answers);
-        self.answer(ix, true, cx);
+        self.answer(ix, true, false, cx);
+    }
+
+    /// The answer appears letter by letter, at least ~180 a second and faster when
+    /// Claude is ahead, so the text flows instead of landing in blocks.
+    fn tick(&mut self, cx: &mut Context<Self>) {
+        if self.ticking {
+            return;
+        }
+        self.ticking = true;
+        self._tick = cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(Duration::from_millis(16)).await;
+                let more = this
+                    .update(cx, |this, cx| {
+                        let text = this.reveal.and_then(|(ix, shown)| match this.items.get(ix) {
+                            Some(Item::Text(t)) => Some((ix, shown, t)),
+                            _ => None,
+                        });
+                        let Some((ix, shown, t)) = text else {
+                            (this.reveal, this.ticking) = (None, false);
+                            return false;
+                        };
+                        let backlog = t[shown.min(t.len())..].chars().count();
+                        // Caught up (more may come: the next text starts the loop again),
+                        // or a card came after it (a tool): the rest shows at once.
+                        if backlog == 0 || ix + 2 < this.items.len() {
+                            if backlog > 0 {
+                                this.reveal = None;
+                            }
+                            this.ticking = false;
+                            cx.notify();
+                            return false;
+                        }
+                        this.reveal = Some((ix, reveal_to(t, shown, (backlog / 6).max(3))));
+                        cx.notify();
+                        true
+                    })
+                    .unwrap_or(false);
+                if !more {
+                    break;
+                }
+            }
+        });
+    }
+
+    /// Asks the mods' engine for the band and every open pane, drawn afresh.
+    fn redraw_mods(&mut self) {
+        let Some(p) = &mut self.proc else { return };
+        self.ui_seq += 1;
+        p.send(surface::render(&format!("ui-band-{}", self.ui_seq), "AbovePrompt", "above-prompt", surface::BAND_COLUMNS));
+        for (id, ..) in &self.panes {
+            p.send(surface::render(&format!("ui-pane-{id}-{}", self.ui_seq), "Pane", id, surface::PANE_COLUMNS));
+        }
+    }
+
+    /// A mod's button pressed: its handler runs in Claude Code, which then asks us to redraw.
+    fn ui_press(&mut self, press: &Value, key: Option<&str>, cx: &mut Context<Self>) {
+        self.ui_seq += 1;
+        let id = format!("ui-press-{}", self.ui_seq);
+        if let Some(p) = &mut self.proc {
+            p.send(surface::press(&id, press, key));
+        }
+        cx.notify();
+    }
+
+    fn close_pane(&mut self, pane: &str, cx: &mut Context<Self>) {
+        self.ui_seq += 1;
+        let id = format!("ui-close-{}", self.ui_seq);
+        if let Some(p) = &mut self.proc {
+            p.send(surface::close(&id, pane));
+        }
+        self.panes.retain(|p| p.0 != pane);
+        cx.notify();
     }
 
     // shortcut: a stopped turn's tokens are not counted (the CLI reports them at its end); upgrade by summing each message's `usage`.
@@ -1229,6 +1612,7 @@ impl ClaudeView {
         self._reader = Task::ready(());
         if self.busy {
             self.items.push(Item::Notice("Arrêté. La conversation reprend au prochain message.".into(), false));
+            self.review(cx);
         }
         self.end_turn();
         cx.notify();
@@ -1238,9 +1622,14 @@ impl ClaudeView {
     fn reset(&mut self, cx: &mut Context<Self>) {
         self.proc = None;
         self._reader = Task::ready(());
-        (self.items, self.session, self.stats, self.model_name, self.restart) = (vec![], None, Stats::default(), String::new(), false);
+        (self.items, self.session, self.stats, self.model_name, self.restart, self.base) = (vec![], None, Stats::default(), String::new(), false, None);
+        self._snap = Task::ready(()); // a message still waiting for its snapshot goes with this conversation
+        (self.queued, self.reveal, self.band, self.panes, self.toast) = (vec![], None, None, vec![], None);
+        (self.ticking, self._tick) = (false, Task::ready(()));
+        self.statuses.clear();
         self.toggled.clear();
         self.picked.clear();
+        self.suggested.clear();
         (self.past, self._past_for) = (None, None);
         self.end_turn();
         cx.notify();
@@ -1274,10 +1663,10 @@ impl ClaudeView {
         // Line by line: the file can weigh hundreds of MB.
         let task = cx.background_executor().spawn(async move { fs::File::open(&path).map(|f| transcript(BufReader::new(f).lines().map_while(Result::ok))).unwrap_or_default() });
         self._load = cx.spawn(async move |this, cx| {
-            let items = task.await;
+            let (items, stats) = task.await;
             let _ = this.update(cx, |this, cx| {
                 if this.session.as_deref() == Some(id.as_str()) && this.items.is_empty() {
-                    this.items = items;
+                    (this.items, this.stats) = (items, stats);
                     this.items.push(Item::Notice("Conversation reprise : votre prochain message la continue.".into(), false));
                     this.to_bottom = true;
                 }
@@ -1415,7 +1804,7 @@ impl ClaudeView {
             if question {
                 self.render_questions(ix, input, pending, cx).into_any_element()
             } else if plan {
-                div().border_t_1().border_color(border).px(r(14.)).py(r(8.)).text_size(r(14.)).child(TextView::markdown(("claude-plan", ix), text_of(&input["plan"]), window, cx).selectable(true)).into_any_element()
+                div().border_t_1().border_color(border).px(r(14.)).py(r(8.)).text_size(r(14.)).child(markdown(("claude-plan", ix), text_of(&input["plan"]), window, cx)).into_any_element()
             } else {
                 let lines = details(name, input, result.as_ref().map(|r| r.0.as_str()));
                 let lines = if lines.is_empty() && pending { vec![(' ', summary(name, input, &root))] } else { lines };
@@ -1427,6 +1816,7 @@ impl ClaudeView {
             _ if plan => ("Approuver", "Continuer à planifier", "Votre accord sur ce plan ?"),
             _ => ("Autoriser", "Refuser", "Claude demande votre autorisation"),
         };
+        let always = ask.as_ref().filter(|_| pending && !question && !plan).and_then(|(request, _)| always_text(self.suggested.get(request)?));
         // A question is answered once each has a choice (or in the box below).
         let ready = !question || (0..input["questions"].as_array().map_or(0, Vec::len)).all(|q| self.picked.get(&(ix, q)).is_some_and(|c| !c.is_empty()));
         let footer = pending.then(|| {
@@ -1438,9 +1828,12 @@ impl ClaudeView {
                 .border_color(yellow.opacity(0.3))
                 .child(if question { Icon::empty().path("icons/circle-help.svg").small().text_color(yellow) } else { Icon::new(IconName::TriangleAlert).small().text_color(yellow) })
                 .child(div().flex_1().min_w_0().text_size(r(12.5)).text_color(if question { muted } else { fg }).child(why))
-                .child(button(SharedString::from(format!("deny-{ix}"))).ghost().small().label(no).on_click(cx.listener(move |this, _, _, cx| this.answer(ix, false, cx))))
+                .child(button(SharedString::from(format!("deny-{ix}"))).ghost().small().label(no).on_click(cx.listener(move |this, _, _, cx| this.answer(ix, false, false, cx))))
+                .when_some(always, |d, why| {
+                    d.child(button(SharedString::from(format!("always-{ix}"))).outline().small().label("Toujours autoriser").tooltip(why).on_click(cx.listener(move |this, _, _, cx| this.answer(ix, true, true, cx))))
+                })
                 .child(button(SharedString::from(format!("allow-{ix}"))).primary().small().icon(IconName::Check).label(yes).disabled(!ready).on_click(cx.listener(move |this, _, _, cx| {
-                    if question { this.reply(ix, None, cx) } else { this.answer(ix, true, cx) }
+                    if question { this.reply(ix, None, cx) } else { this.answer(ix, true, false, cx) }
                 })))
         });
         v_flex()
@@ -1453,6 +1846,68 @@ impl ClaudeView {
             .child(row)
             .children(body)
             .children(footer)
+    }
+
+    /// The files a turn changed: each one's diff a click away, to keep or undo.
+    fn render_changes(&self, ix: usize, files: &[Change], cx: &mut Context<Self>) -> Div {
+        let theme = cx.theme();
+        let (fg, muted, border, green, red, yellow, mono) = (theme.foreground, theme.muted_foreground, theme.border, theme.green, theme.red, theme.yellow, theme.mono_font_family.clone());
+        let hover = ui::hover_bg(cx);
+        let open = files.iter().filter(|f| f.kept.is_none()).count();
+        let n = files.len();
+        let head = h_flex()
+            .gap(r(10.))
+            .px(r(12.))
+            .py(r(8.))
+            .child(tile(rgb(ORANGE).into(), 24., Icon::empty().path("icons/pencil.svg").size(r(13.)).text_color(rgb(ORANGE))))
+            .child(div().flex_1().text_size(r(13.)).font_weight(FontWeight::SEMIBOLD).child(format!("{n} {} modifié{} pendant ce tour", if n > 1 { "fichiers" } else { "fichier" }, if n > 1 { "s" } else { "" })))
+            .when(open > 1, |d| {
+                d.child(button(SharedString::from(format!("keep-all-{ix}"))).ghost().xsmall().label("Tout garder").on_click(cx.listener(move |this, _, _, cx| this.keep(ix, None, cx))))
+                    .child(button(SharedString::from(format!("undo-all-{ix}"))).ghost().xsmall().label("Tout annuler").on_click(cx.listener(move |this, _, window, cx| this.undo(ix, None, window, cx))))
+            });
+        let rows = files.iter().enumerate().map(|(i, f)| {
+            let (path, path2, path3, path4) = (f.path.clone(), f.path.clone(), f.path.clone(), f.path.clone());
+            let (mark, color) = match f.status {
+                'A' => ("Créé", green),
+                'D' => ("Supprimé", red),
+                _ => ("Modifié", yellow),
+            };
+            let row = h_flex()
+                .id(SharedString::from(format!("change-{ix}-{i}")))
+                .gap(r(8.))
+                .px(r(12.))
+                .py(r(5.))
+                .border_t_1()
+                .border_color(border)
+                .cursor_pointer()
+                .hover(|s| s.bg(hover))
+                .on_click(cx.listener(move |this, _, _, cx| this.toggle_diff(ix, &path, cx)))
+                .child(div().w(r(64.)).flex_shrink_0().text_size(r(11.5)).text_color(color).child(mark))
+                .child(div().flex_1().min_w_0().truncate().font_family(mono.clone()).text_size(r(12.)).text_color(if f.kept == Some(false) { muted } else { fg }).when(f.kept == Some(false), |d| d.line_through()).child(f.path.clone()))
+                .when(f.status != 'D' && f.kept != Some(false), |d| {
+                    d.child(button(SharedString::from(format!("change-open-{ix}-{i}"))).ghost().xsmall().icon(IconName::ExternalLink).tooltip("Ouvrir dans l'éditeur").on_click(cx.listener(move |this, _, window, cx| {
+                        cx.stop_propagation();
+                        if let Some(root) = this.root.clone() {
+                            this.open(root.join(&path2), window, cx);
+                        }
+                    })))
+                })
+                .map(|d| match f.kept {
+                    Some(true) => d.child(div().text_size(r(11.5)).text_color(green).child("Gardé")),
+                    Some(false) => d.child(div().text_size(r(11.5)).text_color(muted).child("Annulé")),
+                    None => d
+                        .child(button(SharedString::from(format!("change-keep-{ix}-{i}"))).ghost().xsmall().icon(IconName::Check).tooltip("Garder").on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.keep(ix, Some(path3.clone()), cx);
+                        })))
+                        .child(button(SharedString::from(format!("change-undo-{ix}-{i}"))).ghost().xsmall().icon(IconName::Undo2).tooltip("Annuler : le fichier redevient comme avant ce tour").on_click(cx.listener(move |this, _, window, cx| {
+                            cx.stop_propagation();
+                            this.undo(ix, Some(path4.clone()), window, cx);
+                        }))),
+                });
+            v_flex().child(row).children(f.diff.clone().map(|lines| self.render_lines(lines, cx)))
+        }).collect::<Vec<_>>();
+        v_flex().flex_shrink_0().rounded(r(10.)).border_1().border_color(border).bg(fg.opacity(0.015)).overflow_hidden().child(head).children(rows)
     }
 
     /// Claude's questions: each with its options (one, or several when allowed); once answered, the answers.
@@ -1581,14 +2036,37 @@ impl ClaudeView {
         let theme = cx.theme();
         let (muted, primary, red) = (theme.muted_foreground, theme.primary, theme.red);
         match item {
-            Item::User(text, file) => v_flex()
+            Item::User(text, file, attached, before) => v_flex()
                 .flex_shrink_0()
                 .items_end()
                 .gap(r(4.))
-                .child(div().max_w(relative(0.85)).px(r(14.)).py(r(9.)).rounded(r(14.)).bg(primary.opacity(0.14)).text_size(r(14.)).child(text.clone()))
+                .group(SharedString::from(format!("user-{ix}")))
+                .when(!text.is_empty(), |d| d.child(div().max_w(relative(0.85)).px(r(14.)).py(r(9.)).rounded(r(14.)).rounded_br(r(4.)).bg(primary.opacity(0.14)).text_size(r(14.)).line_height(relative(1.5)).child(text.clone())))
+                .when(!attached.is_empty(), |d| d.child(h_flex().gap(r(4.)).text_size(r(11.5)).text_color(muted).child(Icon::empty().path("icons/paperclip.svg").xsmall()).child(attached.join(", "))))
                 .when_some(file.clone(), |d, f| d.child(h_flex().gap(r(4.)).text_size(r(11.5)).text_color(muted).child(Icon::new(IconName::File).xsmall()).child(f)))
+                // On hover: the project's files back as they were before this message.
+                .when(before.is_some() && !self.busy, |d| {
+                    d.child(
+                        div().invisible().group_hover(SharedString::from(format!("user-{ix}")), |s| s.visible()).child(
+                            button(SharedString::from(format!("rewind-{ix}")))
+                                .ghost()
+                                .xsmall()
+                                .icon(Icon::empty().path("icons/history.svg"))
+                                .label("Revenir avant ce message")
+                                .tooltip("Remet les fichiers du projet comme ils étaient avant ce message")
+                                .on_click(cx.listener(move |this, _, window, cx| this.rewind(ix, window, cx))),
+                        ),
+                    )
+                })
                 .into_any_element(),
-            Item::Text(text) => div().flex_shrink_0().text_size(r(14.)).child(TextView::markdown(("claude-md", ix), text.clone(), window, cx).selectable(true)).into_any_element(),
+            Item::Changes { files, .. } => self.render_changes(ix, files, cx).into_any_element(),
+            Item::Text(text) => {
+                let shown = match self.reveal {
+                    Some((i, n)) if i == ix => text[..n.min(text.len())].to_string(),
+                    _ => text.clone(),
+                };
+                div().flex_shrink_0().text_size(r(14.5)).line_height(relative(1.6)).child(markdown(("claude-md", ix), shown, window, cx)).into_any_element()
+            }
             Item::Tool { .. } => self.render_tool(ix, item, window, cx).into_any_element(),
             Item::Turn { secs: s, usage } => h_flex()
                 .flex_shrink_0()
@@ -1610,7 +2088,7 @@ impl ClaudeView {
         }
     }
 
-    fn render_composer(&self, cx: &mut Context<Self>) -> Div {
+    fn render_composer(&self, window: &mut Window, cx: &mut Context<Self>) -> Div {
         let theme = cx.theme();
         let (muted, border, bg, fg) = (theme.muted_foreground, theme.border, theme.background, theme.foreground);
         let file = self.last_file(cx).map(|p| self.rel(&p));
@@ -1639,15 +2117,64 @@ impl ClaudeView {
                     cx.notify();
                 }))
         });
-        let send = if self.busy {
-            button("claude-stop").small().icon(Icon::new(IconName::Close)).label("Arrêter").on_click(cx.listener(|this, _, _, cx| this.stop(cx)))
-        } else {
-            button("claude-send").primary().small().icon(IconName::ArrowUp).label("Envoyer").on_click(cx.listener(|this, _, window, cx| this.send_input(window, cx)))
-        };
+        // While Claude works: stop it, or send a message it takes at its next step.
+        let stop = self.busy.then(|| button("claude-stop").small().ghost().icon(Icon::new(IconName::Close)).label("Arrêter").on_click(cx.listener(|this, _, _, cx| this.stop(cx))));
+        let send = button("claude-send").primary().small().icon(IconName::ArrowUp).label(if self.busy { "Mettre en file" } else { "Envoyer" }).on_click(cx.listener(|this, _, window, cx| this.send_input(window, cx)));
+        let queued: Vec<Div> = self
+            .queued
+            .iter()
+            .filter_map(|(_, card)| match card {
+                Item::User(text, _, attached, _) => Some(if text.is_empty() { attached.join(", ") } else { text.clone() }),
+                _ => None,
+            })
+            .map(|text| {
+                h_flex()
+                    .gap(r(6.))
+                    .text_size(r(12.5))
+                    .text_color(muted)
+                    .child(Icon::empty().path("icons/history.svg").xsmall())
+                    .child(div().flex_shrink_0().child("En attente :"))
+                    .child(div().flex_1().min_w_0().truncate().text_color(fg).child(text))
+            })
+            .collect();
+        let found: Vec<(String, String, String)> = self.suggestions(cx).into_iter().cloned().collect();
+        let slash = (!found.is_empty()).then(|| {
+            let hover = ui::hover_bg(cx);
+            // A few rows high, scrolled: the box keeps its buttons on screen.
+            v_flex().id("slash-list").max_h(r(220.)).overflow_y_scroll().pb(r(6.)).border_b_1().border_color(border).children(found.into_iter().enumerate().map(|(i, (name, hint, about))| {
+                let pick = name.clone();
+                h_flex()
+                    .id(SharedString::from(format!("slash-{i}")))
+                    .flex_shrink_0() // full height: the list scrolls instead of squeezing them
+                    .gap(r(8.))
+                    .px(r(6.))
+                    .py(r(3.))
+                    .rounded(r(6.))
+                    .cursor_pointer()
+                    .hover(|d| d.bg(hover))
+                    .text_size(r(12.5))
+                    .child(div().flex_shrink_0().font_weight(FontWeight::SEMIBOLD).child(format!("/{name}")))
+                    .when(!hint.is_empty(), |d| d.child(div().flex_shrink_0().text_color(muted).child(hint)))
+                    .child(div().flex_1().min_w_0().truncate().text_color(muted).child(about))
+                    .when(i == 0, |d| d.child(div().flex_shrink_0().text_size(r(11.)).text_color(muted).child("⇥")))
+                    .on_click(cx.listener(move |this, _, window, cx| this.complete(&pick, window, cx)))
+            }))
+        });
+        let band = self.band.as_ref().map(|tree| div().text_size(r(12.5)).pb(r(6.)).border_b_1().border_color(border).child(self.draw(tree, "band", window, cx)));
+        let theme = cx.theme();
+        let notes = (self.toast.is_some() || !self.statuses.is_empty()).then(|| {
+            v_flex()
+                .gap(r(2.))
+                .px(r(6.))
+                .text_size(r(11.5))
+                .text_color(theme.muted_foreground)
+                .children(self.toast.as_ref().map(|(plugin, text)| h_flex().gap(r(6.)).child(div().font_weight(FontWeight::SEMIBOLD).text_color(theme.primary).child(plugin.clone())).child(div().min_w_0().truncate().child(text.clone()))))
+                .children(self.statuses.iter().map(|(plugin, text)| h_flex().gap(r(6.)).child(div().font_weight(FontWeight::SEMIBOLD).child(plugin.clone())).child(div().min_w_0().truncate().child(text.clone()))))
+        });
         h_flex().flex_shrink_0().justify_center().px(r(24.)).pb(r(16.)).pt(r(6.)).child(
             v_flex()
                 .w_full()
-                .max_w(r(860.))
+                .max_w(r(800.))
                 .p(r(10.))
                 .gap(r(8.))
                 .rounded(r(14.))
@@ -1655,27 +2182,69 @@ impl ClaudeView {
                 .border_color(border)
                 .bg(bg)
                 .shadow_sm()
+                .key_context("ClaudeComposer")
+                .capture_action(cx.listener(Self::paste))
+                .capture_action(cx.listener(Self::enter))
+                .capture_action(cx.listener(Self::tab))
+                .children(band)
                 .child(self.render_folder("composer-folder", cx))
+                .children(queued)
+                .when(!self.attachments.is_empty(), |d| d.child(self.render_attachments(cx)))
+                .children(slash)
                 .child(Input::new(&self.input).appearance(false).text_size(r(14.)))
                 .child(
-                    // The choices wrap when narrow; sending stays at the right.
-                    h_flex()
-                        .items_end()
+                    // Two rows, not one that wraps (gpui measures a wrapped row one line high and
+                    // it spills out of the box): the model and the keys, then the mode and sending.
+                    v_flex()
                         .gap(r(8.))
-                        .child(h_flex().flex_1().min_w_0().flex_wrap().gap(r(8.)).child(models).child(modes).children(chip))
-                        .child(div().flex_shrink_0().pb(r(6.)).text_size(r(11.5)).text_color(muted).child("⌘⏎"))
-                        .child(div().flex_shrink_0().child(send)),
-                ),
+                        .child(
+                            h_flex()
+                                .gap(r(8.))
+                                .child(models)
+                                .child(div().min_w_0().children(chip))
+                                .child(div().flex_1())
+                                .child(div().min_w_0().truncate().text_size(r(11.5)).text_color(muted).child(if cfg!(target_os = "macos") { "⏎ envoyer, ⌘⏎ à la ligne" } else { "Entrée : envoyer, Ctrl+Entrée : à la ligne" })),
+                        )
+                        .child(h_flex().gap(r(8.)).child(modes).child(div().flex_1()).children(stop).child(div().flex_shrink_0().child(send))),
+                )
+                .children(notes),
         )
+    }
+
+    /// The pasted images and texts waiting for the next message, each with its ✕.
+    fn render_attachments(&self, cx: &mut Context<Self>) -> Div {
+        let theme = cx.theme();
+        let (muted, border, fg) = (theme.muted_foreground, theme.border, theme.foreground);
+        h_flex().flex_wrap().gap(r(8.)).children(self.attachments.iter().enumerate().map(|(i, a)| {
+            let remove = div()
+                .id(SharedString::from(format!("unattach-{i}")))
+                .cursor_pointer()
+                .text_color(muted)
+                .hover(|d| d.text_color(fg))
+                .tooltip(|window, cx| Tooltip::new("Retirer").build(window, cx))
+                .child(Icon::new(IconName::Close).xsmall())
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if i < this.attachments.len() {
+                        this.attachments.remove(i);
+                    }
+                    cx.notify();
+                }));
+            let body = match a {
+                Attachment::Image { preview, .. } => div().child(img(preview.clone()).h(r(44.)).max_w(r(120.)).rounded(r(4.))),
+                Attachment::Text(_) => h_flex().gap(r(5.)).child(Icon::new(IconName::File).xsmall().text_color(muted)).child(a.label()),
+            };
+            h_flex().gap(r(6.)).p(r(4.)).pl(r(6.)).rounded(r(8.)).border_1().border_color(border).text_size(r(12.)).child(body).child(remove)
+        }))
     }
 
     fn render_empty(&self, cx: &mut Context<Self>) -> Div {
         let theme = cx.theme();
         let (muted, border, hover) = (theme.muted_foreground, theme.border, ui::hover_bg(cx));
         ui::empty_state(Icon::empty().path("icons/claude-code.svg"), rgb(ORANGE).into(), "Que voulez-vous faire ?", "Claude Code lit et modifie les fichiers de ce dossier, avec vos réglages, vos plugins et votre abonnement :", cx)
-        .child(self.render_folder("empty-folder", cx).max_w(r(560.)).mb(r(4.)))
+        .child(self.render_folder("empty-folder", cx).flex_shrink_0().max_w(r(560.)).mb(r(4.)))
         .child(
-            v_flex().mt(r(10.)).gap(r(6.)).children(SUGGESTIONS.iter().enumerate().map(|(i, s)| {
+            // Full height (as the list below): the area scrolls rather than squeezing them.
+            v_flex().flex_shrink_0().mt(r(10.)).gap(r(6.)).children(SUGGESTIONS.iter().enumerate().map(|(i, s)| {
                 h_flex()
                     .id(SharedString::from(format!("suggest-{i}")))
                     .gap(r(8.))
@@ -1693,13 +2262,23 @@ impl ClaudeView {
             })),
         )
         .when(self.past.as_ref().is_some_and(|p| !p.is_empty()), |d| {
-            d.child(v_flex().mt(r(18.)).w(r(420.)).gap(r(8.)).child(ui::section_title("Reprendre une conversation", cx)).child(self.render_past(3, cx)))
+            d.child(v_flex().flex_shrink_0().mt(r(18.)).w(r(420.)).gap(r(8.)).child(ui::section_title("Reprendre une conversation", cx)).child(self.render_past(3, cx)))
         })
     }
 
     /// One row of the conversation's list: a card, or (the last one) what Claude is doing.
     fn render_row(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        // An answer starts after your message: Claude's name above it, as the speaker.
+        let starts_answer = ix > 0 && matches!(self.items.get(ix - 1), Some(Item::User(..))) && matches!(self.items.get(ix), Some(Item::Text(_) | Item::Tool { .. }));
         let content: AnyElement = match self.items.get(ix) {
+            Some(item) if starts_answer => {
+                let muted = cx.theme().muted_foreground;
+                v_flex()
+                    .gap(r(8.))
+                    .child(h_flex().gap(r(6.)).text_size(r(12.5)).font_weight(FontWeight::SEMIBOLD).text_color(muted).child(Icon::empty().path("icons/claude-code.svg").size(r(14.)).text_color(rgb(ORANGE))).child("Claude"))
+                    .child(self.render_item(ix, item, window, cx))
+                    .into_any_element()
+            }
             Some(item) => self.render_item(ix, item, window, cx),
             None => {
                 let muted = cx.theme().muted_foreground;
@@ -1715,15 +2294,15 @@ impl ClaudeView {
             }
         };
         // Block layout, centered by margins: cheaper to lay out than a flex row.
-        div().block().px(r(24.)).pt(r(if ix == 0 { 20. } else { 0. })).pb(r(14.)).child(div().block().w_full().max_w(r(860.)).mx_auto().child(content)).into_any_element()
+        div().block().px(r(24.)).pt(r(if ix == 0 { 20. } else { 0. })).pb(r(14.)).child(div().block().w_full().max_w(r(800.)).mx_auto().child(content)).into_any_element()
     }
 
-    fn render_conversation(&mut self, cx: &mut Context<Self>) -> Div {
+    fn render_conversation(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Div {
         self.sync_log();
         if self.show_past {
             let list = v_flex()
                 .w_full()
-                .max_w(r(860.))
+                .max_w(r(800.))
                 .gap(r(12.))
                 .child(
                     h_flex()
@@ -1740,10 +2319,26 @@ impl ClaudeView {
         } else {
             list(self.log.clone(), cx.processor(|this, ix: usize, window, cx| this.render_row(ix, window, cx))).size_full().into_any_element()
         };
-        v_flex().flex_1().min_w_0().h_full().child(div().flex_1().min_h_0().child(log)).child(self.render_composer(cx))
+        v_flex().flex_1().min_w_0().h_full().child(div().flex_1().min_h_0().child(log)).child(self.render_composer(window, cx))
     }
 
-    fn render_stats(&self, cx: &mut Context<Self>) -> gpui::Stateful<Div> {
+    fn render_stats(&self, window: &mut Window, cx: &mut Context<Self>) -> gpui::Stateful<Div> {
+        let border = cx.theme().border;
+        // The plugins' panes first: what a mod opened beside the conversation.
+        let panes: Vec<Div> = self.panes.iter().map(|(id, title, tree)| {
+                let pane = id.clone();
+                v_flex()
+                    .gap(r(6.))
+                    .pb(r(10.))
+                    .border_b_1()
+                    .border_color(border)
+                    .child(
+                        h_flex()
+                            .child(div().flex_1().min_w_0().truncate().child(ui::section_title(title, cx)))
+                            .child(button(SharedString::from(format!("pane-close-{id}"))).ghost().xsmall().icon(IconName::Close).tooltip("Fermer").on_click(cx.listener(move |this, _, _, cx| this.close_pane(&pane, cx)))),
+                    )
+                    .child(div().text_size(r(12.5)).children(tree.as_ref().map(|t| self.draw(t, &format!("pane-{id}"), window, cx))))
+            }).collect();
         let theme = cx.theme();
         let (fg, muted, border, hover) = (theme.foreground, theme.muted_foreground, theme.border, ui::hover_bg(cx));
         let (green, yellow, red) = (theme.green, theme.yellow, theme.red);
@@ -1765,6 +2360,7 @@ impl ClaudeView {
             .border_color(border)
             .p(r(18.))
             .gap(r(10.))
+            .children(panes)
             .child(section("Cette session"))
             .child(
                 v_flex()
@@ -1855,7 +2451,7 @@ impl ClaudeView {
 }
 
 impl Render for ClaudeView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Another folder opened: a new conversation, there (unless Claude works in a folder of its own).
         let project = self.workspace.upgrade().and_then(|w| w.read(cx).root().map(Path::to_path_buf));
         if project != self.project {
@@ -1899,7 +2495,7 @@ impl Render for ClaudeView {
                 .child(button("claude-pick-folder").primary().mt(r(8.)).icon(IconName::FolderOpen).label("Choisir un dossier").on_click(cx.listener(|this, _, window, cx| this.pick_folder(window, cx))))
                 .into_any_element()
         } else {
-            h_flex().flex_1().min_h_0().child(self.render_conversation(cx)).child(self.render_stats(cx)).into_any_element()
+            h_flex().flex_1().min_h_0().child(self.render_conversation(window, cx)).child(self.render_stats(window, cx)).into_any_element()
         };
         v_flex().size_full().child(header(t, subtitle, actions, cx)).child(body)
     }
@@ -1923,7 +2519,7 @@ mod tests {
         let result = r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":[{"type":"text","text":"a\nb"}],"is_error":true}]},"parent_tool_use_id":null}"#;
         assert_eq!(parse(result), vec![Event::ToolResult { id: "t1".into(), text: "a\nb".into(), error: true }]);
         let ask = r#"{"type":"control_request","request_id":"r1","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"rm x"},"tool_use_id":"t1"}}"#;
-        assert_eq!(parse(ask), vec![Event::Ask { request: "r1".into(), tool_id: "t1".into(), tool: "Bash".into(), input: json!({ "command": "rm x" }) }]);
+        assert_eq!(parse(ask), vec![Event::Ask { request: "r1".into(), tool_id: "t1".into(), tool: "Bash".into(), input: json!({ "command": "rm x" }), rules: Value::Null }]);
         assert_eq!(parse(r#"{"type":"control_request","request_id":"r2","request":{"subtype":"hook_callback"}}"#), vec![Event::Unsupported { request: "r2".into() }]);
         // A sub-agent's steps are not the conversation's.
         assert!(parse(r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t2","name":"Read","input":{}}]},"parent_tool_use_id":"t9"}"#).is_empty());
@@ -1962,23 +2558,90 @@ mod tests {
         // Without a title: the first prompt, without the file we add.
         assert_eq!(read_past("s2".into(), &file.replace("ai-title", "x"), t).map(|p| p.title), Some("Corrige maximum".into()));
         assert_eq!(read_past("s3".into(), r#"{"type":"queue-operation"}"#, t), None);
-        let items = transcript(file.lines().map(str::to_string));
+        let (items, stats) = transcript(file.lines().map(str::to_string));
         assert_eq!(items.len(), 3);
-        assert!(matches!(&items[0], Item::User(text, Some(f)) if text == "Corrige maximum" && f == "src/calc.py"));
+        assert_eq!((stats.turns, stats.tools.get("Modification"), stats.files.len()), (1, Some(&1), 1));
+        assert!(matches!(&items[0], Item::User(text, Some(f), ..) if text == "Corrige maximum" && f == "src/calc.py"));
         assert!(matches!(&items[1], Item::Tool { name, result: Some((out, false)), .. } if name == "Edit" && out == "ok"));
         assert!(matches!(&items[2], Item::Text(text) if text == "C'est corrigé."));
+    }
+
+    #[test]
+    fn mods_and_queued_messages_are_read() {
+        // Lines as Claude Code 2.1.325 writes them (cut down).
+        assert_eq!(parse(r#"{"type":"user","isReplay":true,"uuid":"u1","message":{"role":"user","content":"BANANE"}}"#), vec![Event::Taken("u1".into())]);
+        let drawn = r#"{"type":"control_response","response":{"subtype":"success","request_id":"ui-band-3","response":{"tree":{"type":"Box","children":["x"]},"rewritten":true}}}"#;
+        assert!(matches!(&parse(drawn)[..], [Event::Drawn { request, tree }] if request == "ui-band-3" && tree["type"] == "Box"));
+        // Our other requests' answers (a press, `ui_attach`) and the CLI's own are not drawings.
+        assert!(parse(r#"{"type":"control_response","response":{"request_id":"ui-attach","response":{"surfaces":["desktop"]}}}"#).is_empty());
+        assert!(parse(r#"{"type":"control_response","response":{"request_id":"a1","response":{"tree":{}}}}"#).is_empty());
+        assert_eq!(parse(r#"{"type":"system","subtype":"ui_invalidate","event":"ui.render"}"#), vec![Event::Redraw]);
+        assert_eq!(parse(r#"{"type":"system","subtype":"ui_toast","plugin":"ponytail","text":"Copié","timeout_ms":4000}"#), vec![Event::Toast("ponytail".into(), "Copié".into(), 4000)]);
+        assert_eq!(parse(r#"{"type":"system","subtype":"ui_status","plugin":"p","text":null}"#), vec![Event::Status("p".into(), None)]);
+        assert_eq!(parse(r#"{"type":"system","subtype":"ui_panes","panes":[{"id":"board","title":"Tableau"},{"id":"x"}]}"#), vec![Event::Panes(vec![("board".into(), "Tableau".into()), ("x".into(), "x".into())])]);
+        let init = r#"{"type":"control_response","response":{"request_id":"akolade-init","response":{"commands":[
+            {"name":"compact","description":"Résumer","argumentHint":"","builtin":true},
+            {"name":"ponytail:ponytail-help","description":"(ponytail) Aide","argumentHint":""},
+            {"name":"zeta","description":"Mon skill","argumentHint":""},
+            {"name":"Alpha","description":"Le mien aussi","argumentHint":"<x>"},
+            {"name":"anthropic-skills:docs","description":"Docs (claude.ai sync)","argumentHint":""}]}}}"#;
+        let Event::Commands(c) = parse(&init.replace('\n', "")).remove(0) else { panic!() };
+        let names: Vec<&str> = c.iter().map(|c| c.0.as_str()).collect();
+        assert_eq!(names, ["Alpha", "anthropic-skills:docs", "zeta", "ponytail:ponytail-help", "compact"]);
+        assert_eq!(c[0], ("Alpha".into(), "<x>".into(), "Le mien aussi".into()));
+        // Letter by letter, never inside a character.
+        assert_eq!(reveal_to("héhé", 0, 2), 3);
+        assert_eq!(reveal_to("héhé", 3, 10), 6);
+    }
+
+    #[test]
+    fn pasted_images_and_texts_go_with_the_message() {
+        // A wide screenshot: scaled to 1568 px, sent as PNG.
+        let mut wide = vec![];
+        image::DynamicImage::new_rgb8(3000, 100).write_to(&mut std::io::Cursor::new(&mut wide), image::ImageFormat::Png).unwrap();
+        let (media, bytes) = for_claude(&wide).unwrap();
+        assert_eq!((media, image::load_from_memory(&bytes).unwrap().width()), ("image/png", 1568));
+        assert_eq!(for_claude(b"<svg/>"), None);
+        assert!(is_long(&"l\n".repeat(21)) && !is_long("court"));
+        // Images first, then the text; without an image, the text as before.
+        let image = Attachment::Image { media, bytes, preview: Arc::new(gpui::Image::from_bytes(gpui::ImageFormat::Png, vec![])) };
+        let c = content("Que vois-tu ?", &[image]);
+        assert_eq!((c[0]["type"].as_str(), c[0]["source"]["media_type"].as_str(), c[1]["text"].as_str()), (Some("image"), Some("image/png"), Some("Que vois-tu ?")));
+        assert_eq!(content("salut", &[Attachment::Text("x".into())]), json!("salut"));
+    }
+
+    #[test]
+    fn a_resumed_conversation_gets_its_numbers_back() {
+        let answer = r#"{"type":"assistant","message":{"id":"m1","model":"claude-haiku-5-5","usage":{"input_tokens":2,"output_tokens":30,"cache_read_input_tokens":100,"cache_creation_input_tokens":8},"content":[{"type":"text","text":"a"}]}}"#;
+        let more = answer.replace(r#"{"type":"text","text":"a"}"#, r#"{"type":"tool_use","id":"t","name":"Bash","input":{}}"#);
+        let lines = |extra: &[&str]| [r#"{"type":"user","message":{"content":"salut"}}"#, answer, &more].iter().chain(extra).map(|l| l.to_string()).collect::<Vec<_>>();
+        // No saved totals: the answer's tokens once (its two lines are one answer), its context.
+        let (_, s) = transcript(lines(&[]).into_iter());
+        assert_eq!((s.usage.output, s.usage.cost, s.context, s.turns), (30, 0., 110, 1));
+        assert_eq!(s.tools.get("Commande"), Some(&1));
+        // Saved totals: those of the process started last, whatever their order in the file.
+        let totals = |start: u64, cost: f64| format!(r#"{{"type":"cost-state","startTime":{start},"totalAPIDuration":4500,"modelUsage":{{"claude-opus-5-5":{{"inputTokens":5,"outputTokens":70,"costUSD":{cost}}}}}}}"#);
+        let (newer, older) = (totals(20, 2.5), totals(10, 1.));
+        let (_, s) = transcript(lines(&[&newer, &older]).into_iter());
+        assert_eq!((s.usage.output, s.usage.cost, s.secs, s.models.len()), (70, 2.5, 4.5, 1));
     }
 
     #[test]
     fn answers_permission_requests_as_the_cli_expects() {
         let input = json!({ "command": "ls" });
         assert_eq!(
-            permission_response("r1", true, &input),
+            permission_response("r1", true, &input, None),
             json!({ "type": "control_response", "response": { "subtype": "success", "request_id": "r1", "response": { "behavior": "allow", "updatedInput": { "command": "ls" } } } })
         );
-        let no = permission_response("r2", false, &input);
+        let no = permission_response("r2", false, &input, None);
         assert_eq!((no["response"]["request_id"].as_str(), no["response"]["response"]["behavior"].as_str()), (Some("r2"), Some("deny")));
         assert!(no["response"]["response"]["message"].is_string(), "a refusal says why");
+        // "Toujours autoriser": Claude Code's own suggestion goes back, and says what it keeps.
+        let rules = json!([{ "type": "addRules", "rules": [{ "toolName": "Bash", "ruleContent": "git status *" }], "behavior": "allow", "destination": "localSettings" }]);
+        assert_eq!(permission_response("r3", true, &input, Some(&rules))["response"]["response"]["updatedPermissions"], rules);
+        assert_eq!(always_text(&rules).as_deref(), Some("Ne plus demander : Commande « git status * », dans ce projet"));
+        assert_eq!(always_text(&json!([{ "type": "setMode", "mode": "acceptEdits", "destination": "session" }])).as_deref(), Some("Ne plus demander : les modifications de fichiers, pendant cette conversation"));
+        assert_eq!(always_text(&Value::Null), None);
     }
 
     #[test]

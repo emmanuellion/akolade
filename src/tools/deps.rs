@@ -17,6 +17,7 @@ use gpui_component::{ActiveTheme, Disableable, Icon, IconName, Sizable, WindowEx
 use serde_json::Value;
 
 use crate::{
+    ui::plural,
     tools::{header, tool},
     ui,
     workspace::{Workspace, button, r},
@@ -785,10 +786,6 @@ pub struct DepsView {
 
 fn pill(text: impl Into<SharedString>, color: Hsla) -> Div {
     div().flex_shrink_0().px(r(6.)).py(r(1.)).rounded(r(4.)).bg(color.opacity(0.14)).text_color(color).text_size(r(11.5)).font_weight(FontWeight::MEDIUM).child(text.into())
-}
-
-fn plural(n: usize, word: &str) -> String {
-    format!("{n} {word}{}", if n > 1 { "s" } else { "" })
 }
 
 /// A newer version than the installed one (or the declared one, if not installed).

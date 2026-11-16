@@ -679,18 +679,20 @@ impl Render for PluginsView {
             matches(&words.iter().map(String::as_str).collect::<Vec<_>>())
         };
         let settings = AppSettings::get(cx);
-        // Installed first; each looked up once (PATH lookups), not per comparison.
+        // By name; installed or not looked up once each (PATH lookups).
         let with_installed = |list: Vec<Plugin>| {
             let mut list: Vec<(Plugin, bool)> = list.into_iter().filter(&keep).map(|p| {
                 let i = self.found.installed(&p);
                 (p, i)
             }).collect();
-            list.sort_by_key(|(_, i)| !i);
+            list.sort_by_cached_key(|(p, _)| crate::ui::sort_key(&p.name()));
             list
         };
         let (completion, format, lint) = (with_installed(plugins()), with_installed(formatters()), with_installed(linters()));
-        let tools: Vec<&'static Tool> = TOOLS.iter().filter(|t| matches(&[t.name, t.about, t.meta, "outils"])).collect();
-        let packs: Vec<(&'static str, &'static str, &'static str)> = icons::PACKS.into_iter().filter(|(_, name, about)| matches(&[name, about, "icônes"])).collect();
+        let mut tools: Vec<&'static Tool> = TOOLS.iter().filter(|t| matches(&[t.name, t.about, t.meta, "outils"])).collect();
+        tools.sort_by_cached_key(|t| crate::ui::sort_key(t.name));
+        let mut packs: Vec<(&'static str, &'static str, &'static str)> = icons::PACKS.into_iter().filter(|(_, name, about)| matches(&[name, about, "icônes"])).collect();
+        packs.sort_by_cached_key(|p| crate::ui::sort_key(p.1));
         let themes: Vec<&'static Palette> = themes::all().into_iter().filter(|t| matches(&[t.name, "thème", if t.dark { "sombre" } else { "clair" }])).collect();
         let mine = |p: &&(Plugin, bool)| p.1;
         let mine_count = completion.iter().filter(mine).count() + format.iter().filter(mine).count() + lint.iter().filter(mine).count() + tools.iter().filter(|t| settings.tool_added(t.id)).count() + themes.iter().filter(|t| t.name == settings.theme).count();

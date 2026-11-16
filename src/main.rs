@@ -91,11 +91,14 @@ fn main() {
             KeyBinding::new("f12", GoToDefinitionKey, Some("Workspace")),
             KeyBinding::new("shift-f12", FindReferences, Some("Workspace")),
             KeyBinding::new("f2", RenameSymbol, Some("Workspace")),
+            KeyBinding::new("secondary-.", QuickFix, Some("Workspace")),
             KeyBinding::new("secondary-\\", SplitEditor, Some("Workspace")),
             // French keyboards: "\\" needs ⌥⇧, so also ⌘⇧D ("dédoubler").
             KeyBinding::new("secondary-shift-d", SplitEditor, Some("Workspace")),
             // ⌘F is gpui-component's; Ctrl+F as well on macOS.
             KeyBinding::new("ctrl-f", gpui_component::input::Search, Some("Input")),
+            // Claude Code's box: ⏎ sends, ⇧⏎ goes to the line (as ⌘⏎).
+            KeyBinding::new("shift-enter", gpui_component::input::Enter { secondary: true }, Some("ClaudeComposer > Input")),
         ]);
         cx.bind_keys((1..=9).map(|n| KeyBinding::new(&format!("secondary-{n}"), SelectTab(n), Some("Workspace"))));
         cx.on_window_closed(|cx| {
