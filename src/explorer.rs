@@ -214,7 +214,7 @@ mod tests {
     #[test]
     fn scan_skips_hidden_and_dependency_folders_and_sorts_folders_first() {
         let root = project("scan");
-        let all: Vec<String> = scan(&root, &ScanOptions::default()).iter().map(|e| e.rel.to_string_lossy().into_owned()).collect();
+        let all: Vec<String> = scan(&root, &ScanOptions::default()).iter().map(|e| e.rel.to_string_lossy().replace('\\', "/")).collect();
         assert_eq!(all, ["Docs", "src", "b.txt", "README.md", "src/ui", "src/main.ts", "src/ui/button.ts"], "level by level");
         let mut ex = Explorer::default();
         ex.load(&root, &ScanOptions::default());
