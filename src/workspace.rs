@@ -2100,7 +2100,7 @@ impl Workspace {
     fn close_buffer(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(b) = self.buffers.get(ix) else { return };
         // Closing Claude's tab stops it (and what it runs): asked like an unsaved file.
-        let working = matches!(&b.view, View::Tool { id: "claude", view } if view.clone().downcast::<crate::tools::claude::ClaudeView>().is_ok_and(|c| c.read(cx).is_busy()));
+        let working = matches!(&b.view, View::Tool { id: "claude", view } if view.clone().downcast::<crate::tools::claude::ClaudeView>().is_ok_and(|c| c.read(cx).is_busy(cx)));
         if (b.dirty || working) && !confirm(&mut self.discard, Discard::Tab(b.id())) {
             let armed = self.discard;
             self.activate(ix, window, cx); // shows the tab, but must stay armed

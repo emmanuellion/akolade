@@ -14,7 +14,7 @@ use gpui::{AnyElement, Context, Hsla, Window, InteractiveElement, IntoElement, P
 use gpui_component::{ActiveTheme, Sizable, button::ButtonVariants, h_flex, v_flex};
 use serde_json::{Value, json};
 
-use super::{ClaudeView, ORANGE, markdown};
+use super::{ClaudeSession, ORANGE, markdown};
 use crate::workspace::{button, r};
 
 pub const CLIENT: &str = "akolade";
@@ -69,7 +69,7 @@ fn cells(v: &Value) -> Option<f32> {
     v.as_f64().map(|n| n as f32)
 }
 
-impl ClaudeView {
+impl ClaudeSession {
     /// One element of a mod's tree; `path` makes the ids of its parts unique.
     pub(super) fn draw(&self, node: &Value, path: &str, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         if let Some(s) = node.as_str() {

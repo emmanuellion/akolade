@@ -632,7 +632,28 @@ struct Stats {
     files: Vec<PathBuf>,
 }
 
-pub struct ClaudeView {
+/// How a session is shown and where it works.
+#[derive(Clone)]
+pub struct SessionOptions {
+    /// The tab's header and statistics panel around the conversation (the Claude Code
+    /// tab); without: the conversation and its box only (a multiplexer panel).
+    pub chrome: bool,
+    /// Follows the folder open in the editor (the tab); else stays in its own.
+    pub follow_editor: bool,
+}
+
+impl SessionOptions {
+    /// The Claude Code tab.
+    pub fn tab() -> Self {
+        Self { chrome: true, follow_editor: true }
+    }
+}
+
+/// One conversation with `claude`: its process, the stream of events, the cards,
+/// the numbers, the permission requests waiting and its folder. It draws its own
+/// conversation (cards and box): the Claude Code tab shows one, the multiplexer many.
+pub struct ClaudeSession {
+    pub(crate) opts: SessionOptions,
     workspace: WeakEntity<Workspace>,
     root: Option<PathBuf>,
     program: Option<PathBuf>,
@@ -711,8 +732,8 @@ pub struct ClaudeView {
     _subs: Vec<Subscription>,
 }
 
-impl ClaudeView {
-    pub fn new(workspace: WeakEntity<Workspace>, root: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+impl ClaudeSession {
+    pub fn new(workspace: WeakEntity<Workspace>, root: Option<PathBuf>, opts: SessionOptions, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let input = cx.new(|cx| InputState::new(window, cx).multi_line(true).auto_grow(2, 10).placeholder("Demandez quelque chose à Claude…"));
         let subs = vec![
             cx.observe_global::<AppSettings>(|this, cx| this.apply_settings(cx)),
@@ -728,6 +749,7 @@ impl ClaudeView {
             }),
         ];
         let mut view = Self {
+            opts,
             workspace,
             root,
             program: find_claude(),
@@ -2450,10 +2472,10 @@ impl ClaudeView {
     }
 }
 
-impl Render for ClaudeView {
+impl Render for ClaudeSession {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Another folder opened: a new conversation, there (unless Claude works in a folder of its own).
-        let project = self.workspace.upgrade().and_then(|w| w.read(cx).root().map(Path::to_path_buf));
+        let project = if self.opts.follow_editor { self.workspace.upgrade().and_then(|w| w.read(cx).root().map(Path::to_path_buf)) } else { self.project.clone() };
         if project != self.project {
             self.project = project.clone();
             if self.custom {
@@ -2494,10 +2516,34 @@ impl Render for ClaudeView {
             ui::empty_state(Icon::new(IconName::FolderOpen), rgb(ORANGE).into(), "Où Claude doit-il travailler ?", "Ouvrez un projet dans l'éditeur, ou choisissez un dossier rien que pour Claude.", cx)
                 .child(button("claude-pick-folder").primary().mt(r(8.)).icon(IconName::FolderOpen).label("Choisir un dossier").on_click(cx.listener(|this, _, window, cx| this.pick_folder(window, cx))))
                 .into_any_element()
+        } else if !self.opts.chrome {
+            return v_flex().size_full().child(self.render_conversation(window, cx));
         } else {
             h_flex().flex_1().min_h_0().child(self.render_conversation(window, cx)).child(self.render_stats(window, cx)).into_any_element()
         };
-        v_flex().size_full().child(header(t, subtitle, actions, cx)).child(body)
+        v_flex().size_full().when(self.opts.chrome, |d| d.child(header(t, subtitle, actions, cx))).child(body)
+    }
+}
+
+/// The Claude Code tab: one session, with its header and its statistics.
+pub struct ClaudeView {
+    session: Entity<ClaudeSession>,
+}
+
+impl ClaudeView {
+    pub fn new(workspace: WeakEntity<Workspace>, root: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        Self { session: cx.new(|cx| ClaudeSession::new(workspace, root, SessionOptions::tab(), window, cx)) }
+    }
+
+    /// Claude is answering or running a tool.
+    pub fn is_busy(&self, cx: &gpui::App) -> bool {
+        self.session.read(cx).is_busy()
+    }
+}
+
+impl Render for ClaudeView {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div().size_full().child(self.session.clone())
     }
 }
 
