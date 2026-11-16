@@ -11,12 +11,13 @@ pub mod worktree;
 
 use std::path::{Path, PathBuf};
 
-use gpui::{AnyElement, AppContext, Context, Entity, FontWeight, Hsla, InteractiveElement, IntoElement, ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Subscription, WeakEntity, Window, div, prelude::FluentBuilder, relative, uniform_list};
+use gpui::{AnyElement, App, AppContext, Context, Entity, FontWeight, Hsla, InteractiveElement, IntoElement, ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Subscription, WeakEntity, Window, div, prelude::FluentBuilder, relative, uniform_list};
 use gpui_component::{
     ActiveTheme, Disableable, Icon, IconName, Sizable, WindowExt,
     button::ButtonVariants,
     h_flex,
     input::{Input, InputState},
+    menu::{DropdownMenu, PopupMenuItem},
     resizable::{h_resizable, resizable_panel, v_resizable},
     tooltip::Tooltip,
     v_flex,
@@ -642,9 +643,8 @@ impl MuxView {
             WorkMode::Direct => "Dans le dossier du projet lui-même, comme l'onglet Claude Code.",
             WorkMode::Isolated => "Dans son propre worktree, sur la branche akolade/<nom> : rien ne touche votre copie.",
         };
-        let models = seg("mux-model", MODELS.iter().map(|m| m.0).collect(), form.model, |f, i| f.model = i, cx);
+        let models = self.render_model_picker(form.model, form.effort, cx);
         let perms = seg("mux-perm", MODES.iter().map(|m| m.0).collect(), form.perm, |f, i| f.perm = i, cx);
-        let efforts = seg("mux-effort", EFFORTS.iter().map(|e| e.1).collect(), form.effort, |f, i| f.effort = i, cx);
         let ready = form.folder.is_some() && refusal.is_none();
         Some(
             v_flex()
@@ -664,9 +664,8 @@ impl MuxView {
                 .child(row("Rôle", Input::new(&form.role).small().into_any_element()))
                 .child(row("Tâche", Input::new(&form.task).small().into_any_element()))
                 .child(row("Mode de travail", h_flex().gap(r(10.)).child(mode).child(div().text_size(r(12.)).text_color(muted).child(mode_about)).into_any_element()))
-                .child(row("Modèle", models.into_any_element()))
+                .child(row("Modèle", models))
                 .child(row("Autorisations", perms.into_any_element()))
-                .child(row("Effort", efforts.into_any_element()))
                 .child(row("Budget ($)", div().w(r(140.)).child(Input::new(&form.budget).small()).into_any_element()))
                 .when_some(refusal, |d, why| {
                     d.child(
@@ -796,6 +795,49 @@ impl MuxView {
                     .child(to)
                     .child(h_flex().w_full().gap(r(6.)).child(Input::new(&self.compose).small().flex_1()).child(button("mux-send").small().primary().icon(IconName::ArrowUp).tooltip("Envoyer : le message arrive aussitôt aux sessions").on_click(cx.listener(|this, _, window, cx| this.send_compose(window, cx))))),
             )
+            .into_any_element()
+    }
+
+    /// The model and its thinking effort in one menu, as in Claude's chat: each model with what
+    /// it is for, then the effort; the choice is checked.
+    fn render_model_picker(&self, model: usize, effort: usize, cx: &mut Context<Self>) -> AnyElement {
+        const ABOUT: [&str; 4] = ["Celui de vos réglages Claude Code", "Le plus capable, pour les tâches complexes", "Rapide et précis, pour le travail de tous les jours", "Le plus rapide et le moins cher, pour les tâches simples"];
+        let name = if model == 0 { "Modèle par défaut".to_string() } else { MODELS[model].0.to_string() };
+        let label = format!("{name} · effort {}", EFFORTS[effort].1.to_lowercase());
+        let view = cx.entity().downgrade();
+        let pick = move |model: Option<usize>, effort: Option<usize>| {
+            let view = view.clone();
+            move |_: &gpui::ClickEvent, _: &mut Window, cx: &mut App| {
+                let _ = view.update(cx, |this, cx| {
+                    if let Some(f) = &mut this.form {
+                        f.model = model.unwrap_or(f.model);
+                        f.effort = effort.unwrap_or(f.effort);
+                    }
+                    cx.notify();
+                });
+            }
+        };
+        // Its own width, the arrow after the words (the row would stretch it).
+        h_flex().child(button("mux-model")
+            .small()
+            .outline()
+            .child(h_flex().gap(r(6.)).child(label).child(Icon::new(IconName::ChevronDown).xsmall()))
+            .dropdown_menu(move |mut menu, _, _| {
+                menu = menu.min_w(gpui::px(320.)).check_side(gpui_component::Side::Right).label("Modèle");
+                for (i, (m, about)) in MODELS.iter().zip(ABOUT).enumerate() {
+                    let title = m.0;
+                    menu = menu.item(
+                        PopupMenuItem::element(move |_, cx: &mut App| v_flex().py(r(2.)).child(div().child(title)).child(div().text_size(r(11.5)).text_color(cx.theme().muted_foreground).child(about)))
+                            .checked(i == model)
+                            .on_click(pick(Some(i), None)),
+                    );
+                }
+                menu = menu.separator().label("Effort de réflexion");
+                for (i, e) in EFFORTS.iter().enumerate() {
+                    menu = menu.item(PopupMenuItem::new(e.1).checked(i == effort).on_click(pick(None, Some(i))));
+                }
+                menu
+            }))
             .into_any_element()
     }
 
