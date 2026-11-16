@@ -94,6 +94,8 @@ struct Form {
     model: usize,
     perm: usize,
     effort: usize,
+    /// The optional fields shown (only the project is required).
+    more: bool,
 }
 
 pub struct MuxView {
@@ -235,8 +237,7 @@ impl MuxView {
     fn open_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let settings = AppSettings::get(cx).clone();
         let input = |placeholder: &'static str, window: &mut Window, cx: &mut Context<Self>| cx.new(|cx| InputState::new(window, cx).placeholder(placeholder));
-        let n = self.next_id;
-        let name = cx.new(|cx| InputState::new(window, cx).default_value(format!("session-{n}")));
+        let name = cx.new(|cx| InputState::new(window, cx).placeholder("Automatique : d'après le projet"));
         let path = cx.new(|cx| InputState::new(window, cx).placeholder("ou collez le chemin d'un dossier"));
         let sub = cx.subscribe(&path, |this, input, e: &gpui_component::input::InputEvent, cx| {
             if matches!(e, gpui_component::input::InputEvent::Change) {
@@ -258,6 +259,7 @@ impl MuxView {
             model: MODELS.iter().position(|m| m.1 == settings.claude_model).unwrap_or(0),
             perm: MODES.iter().position(|m| m.1 == settings.claude_mode).unwrap_or(0),
             effort: EFFORTS.iter().position(|e| e.0 == settings.claude_effort).unwrap_or(0),
+            more: false,
         };
         self.form = Some(form);
         cx.notify();
@@ -277,14 +279,42 @@ impl MuxView {
         cx.notify();
     }
 
-    fn pick_folder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// A folder from the system's picker: into the form, or (`at_once`) a session started there.
+    fn pick_folder(&mut self, at_once: bool, window: &mut Window, cx: &mut Context<Self>) {
         let rx = cx.prompt_for_paths(gpui::PathPromptOptions { files: false, directories: true, multiple: false, prompt: Some("Choisir".into()) });
         cx.spawn_in(window, async move |this, cx| {
             let Ok(Ok(Some(mut paths))) = rx.await else { return };
             let Some(path) = paths.pop() else { return };
-            let _ = this.update(cx, |this, cx| this.set_folder(path, cx));
+            let _ = this.update_in(cx, |this, window, cx| if at_once { this.quick(path, window, cx) } else { this.set_folder(path, cx) });
         })
         .detach();
+    }
+
+    /// A session on `folder` at once, everything else automatic: its name from the project's,
+    /// its mode from who is there, the Claude Code tab's settings. The form stays open only
+    /// to say why it cannot start (not a Git repository…).
+    fn quick(&mut self, folder: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_form(window, cx);
+        self.set_folder(folder, cx);
+        self.launch(window, cx);
+    }
+
+    /// A name no session has yet, from its project's: calc, calc-2, calc-3…
+    fn auto_name(&self, project: &Path) -> String {
+        let base = name_of(project);
+        (1..).map(|n| if n == 1 { base.clone() } else { format!("{base}-{n}") }).find(|n| !self.slots.iter().any(|s| s.name == *n)).unwrap_or(base)
+    }
+
+    /// The editor's project, then the multiplexer's and the recent ones (6 at most).
+    fn recent(&self, cx: &App) -> Vec<PathBuf> {
+        let mut recent: Vec<PathBuf> = self.workspace.upgrade().and_then(|w| w.read(cx).root().map(Path::to_path_buf)).into_iter().collect();
+        for p in self.projects().into_iter().chain(AppSettings::get(cx).recent_folders.iter().cloned()) {
+            if !recent.contains(&p) && p.is_dir() {
+                recent.push(p);
+            }
+        }
+        recent.truncate(6);
+        recent
     }
 
     /// Why the form's project cannot take this session now (None: it can).
@@ -319,11 +349,11 @@ impl MuxView {
         }
         let Some(folder) = form.folder.clone() else { return };
         let read = |i: &Entity<InputState>, cx: &Context<Self>| i.read(cx).value().trim().to_string();
-        let name = Some(read(&form.name, cx)).filter(|n| !n.is_empty()).unwrap_or_else(|| format!("session-{}", self.next_id));
+        let project = project::project_of(&folder);
+        let name = Some(read(&form.name, cx)).filter(|n| !n.is_empty()).unwrap_or_else(|| self.auto_name(&project));
         let (role, task) = (read(&form.role, cx), read(&form.task, cx));
         let budget = read(&form.budget, cx).replace(',', ".").parse::<f64>().ok().filter(|b| *b > 0.);
         let (mode, model, perm, effort) = (form.mode, form.model, form.perm, form.effort);
-        let project = project::project_of(&folder);
         let id = format!("{}-{}", project::slug(&name), self.next_id);
         self.next_id += 1;
         let launch = Launch { id, name, role, task, project, mode, model, perm, effort, budget, conversation: None };
@@ -598,14 +628,7 @@ impl MuxView {
         let label = |text: &'static str| div().w(r(110.)).flex_shrink_0().text_size(r(12.5)).text_color(muted).child(text);
         let row = |l: &'static str, content: AnyElement| h_flex().gap(r(10.)).items_center().child(label(l)).child(div().flex_1().min_w_0().child(content));
         // The editor's project and the recent ones, then any folder.
-        let settings = AppSettings::get(cx);
-        let mut recent: Vec<PathBuf> = self.workspace.upgrade().and_then(|w| w.read(cx).root().map(Path::to_path_buf)).into_iter().collect();
-        for p in self.projects().into_iter().chain(settings.recent_folders.iter().cloned()) {
-            if !recent.contains(&p) && p.is_dir() {
-                recent.push(p);
-            }
-        }
-        recent.truncate(6);
+        let recent = self.recent(cx);
         let shown = recent.clone();
         let folder = h_flex()
             .gap(r(6.))
@@ -624,7 +647,7 @@ impl MuxView {
                     .icon(IconName::FolderOpen)
                     .label(other.as_deref().map_or_else(|| "Autre dossier…".into(), name_of))
                     .tooltip(other.as_deref().map_or_else(|| "Choisir un dossier".into(), |p| p.display().to_string()))
-                    .on_click(cx.listener(|this, _, window, cx| this.pick_folder(window, cx)))
+                    .on_click(cx.listener(|this, _, window, cx| this.pick_folder(false, window, cx)))
             });
         let seg = |id: &'static str, labels: Vec<&'static str>, on: usize, pick: fn(&mut Form, usize), cx: &mut Context<Self>| {
             h_flex().gap(r(2.)).p(r(2.)).rounded(r(8.)).bg(cx.theme().foreground.opacity(0.05)).children(labels.into_iter().enumerate().map(|(i, l)| {
@@ -660,13 +683,15 @@ impl MuxView {
                 .child(div().text_size(r(14.)).font_weight(FontWeight::SEMIBOLD).child("Nouvelle session"))
                 .child(row("Projet", folder.into_any_element()))
                 .child(row("", Input::new(&form.path).small().into_any_element()))
-                .child(row("Nom", Input::new(&form.name).small().into_any_element()))
-                .child(row("Rôle", Input::new(&form.role).small().into_any_element()))
-                .child(row("Tâche", Input::new(&form.task).small().into_any_element()))
-                .child(row("Mode de travail", h_flex().gap(r(10.)).child(mode).child(div().text_size(r(12.)).text_color(muted).child(mode_about)).into_any_element()))
-                .child(row("Modèle", models))
-                .child(row("Autorisations", perms.into_any_element()))
-                .child(row("Budget ($)", div().w(r(140.)).child(Input::new(&form.budget).small()).into_any_element()))
+                .when(form.more, |d| {
+                    d.child(row("Nom", Input::new(&form.name).small().into_any_element()))
+                        .child(row("Rôle", Input::new(&form.role).small().into_any_element()))
+                        .child(row("Tâche", Input::new(&form.task).small().into_any_element()))
+                        .child(row("Mode de travail", h_flex().gap(r(10.)).child(mode).child(div().text_size(r(12.)).text_color(muted).child(mode_about)).into_any_element()))
+                        .child(row("Modèle", models))
+                        .child(row("Autorisations", perms.into_any_element()))
+                        .child(row("Budget ($)", div().w(r(140.)).child(Input::new(&form.budget).small()).into_any_element()))
+                })
                 .when_some(refusal, |d, why| {
                     d.child(
                         h_flex()
@@ -683,7 +708,20 @@ impl MuxView {
                 .child(
                     h_flex()
                         .gap(r(8.))
-                        .justify_end()
+                        .child(
+                            button("mux-more")
+                                .small()
+                                .ghost()
+                                .label(if form.more { "Moins d'options" } else { "Plus d'options : nom, rôle, tâche, mode, modèle…" })
+                                .icon(Icon::new(if form.more { IconName::ChevronUp } else { IconName::ChevronDown }).xsmall())
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    if let Some(f) = &mut this.form {
+                                        f.more = !f.more;
+                                    }
+                                    cx.notify();
+                                })),
+                        )
+                        .child(div().flex_1())
                         .child(button("mux-cancel").small().ghost().label("Annuler").on_click(cx.listener(|this, _, _, cx| {
                             this.form = None;
                             cx.notify();
@@ -795,6 +833,39 @@ impl MuxView {
                     .child(to)
                     .child(h_flex().w_full().gap(r(6.)).child(Input::new(&self.compose).small().flex_1()).child(button("mux-send").small().primary().icon(IconName::ArrowUp).tooltip("Envoyer : le message arrive aussitôt aux sessions").on_click(cx.listener(|this, _, window, cx| this.send_compose(window, cx))))),
             )
+            .into_any_element()
+    }
+
+    /// "À plat": a Claude Code session in one click, on a project of the menu, without the form.
+    fn render_quick_menu(&self, cx: &mut Context<Self>) -> AnyElement {
+        let recent = self.recent(cx);
+        let view = cx.entity().downgrade();
+        type Act = fn(&mut MuxView, Option<PathBuf>, &mut Window, &mut Context<MuxView>);
+        let on = move |act: Act, arg: Option<PathBuf>| {
+            let view = view.clone();
+            move |_: &gpui::ClickEvent, window: &mut Window, cx: &mut App| {
+                let _ = view.update(cx, |this, cx| act(this, arg.clone(), window, cx));
+            }
+        };
+        button("mux-new")
+            .small()
+            .primary()
+            .icon(IconName::Plus)
+            .label("Nouvelle session")
+            .disabled(self.form.is_some())
+            .dropdown_menu_with_anchor(gpui::Corner::TopRight, move |mut menu, _, _| {
+                menu = menu.min_w(gpui::px(300.)).max_w(gpui::px(380.)).label("Lancer Claude Code dans…");
+                for p in &recent {
+                    let (name, path) = (name_of(p), p.display().to_string().replacen(&crate::platform::home().display().to_string(), "~", 1));
+                    menu = menu.item(
+                        PopupMenuItem::element(move |_, cx: &mut App| v_flex().py(r(2.)).child(div().child(name.clone())).child(div().w(r(300.)).truncate().text_size(r(11.5)).text_color(cx.theme().muted_foreground).child(path.clone())))
+                            .on_click(on(|this, p, window, cx| this.quick(p.unwrap_or_default(), window, cx), Some(p.clone()))),
+                    );
+                }
+                menu.separator()
+                    .item(PopupMenuItem::new("Autre dossier…").icon(IconName::FolderOpen).on_click(on(|this, _, window, cx| this.pick_folder(true, window, cx), None)))
+                    .item(PopupMenuItem::new("Avec options…").icon(IconName::Settings).on_click(on(|this, _, window, cx| this.open_form(window, cx), None)))
+            })
             .into_any_element()
     }
 
@@ -1033,7 +1104,7 @@ impl MuxView {
             // Two rows share the height, resizable, when both keep room for their conversation.
             2 if window.viewport_size().height >= r(1100.).to_pixels(window.rem_size()) => {
                 let both: Vec<AnyElement> = rows.iter().map(|row| self.render_row(row, cx)).collect();
-                v_resizable("mux-rows").children(both.into_iter().map(|row| resizable_panel().child(row))).into_any_element()
+                v_resizable("mux-rows").children(both.into_iter().map(|row| resizable_panel().child(div().absolute().size_full().child(row)))).into_any_element()
             }
             // More: each its own height, the grid scrolls; only the rows on screen are built and drawn.
             n => uniform_list("mux-grid", n, cx.processor(move |this, range: std::ops::Range<usize>, _, cx| {
@@ -1064,7 +1135,10 @@ impl MuxView {
                 .child(div().flex_1())
                 .child(div().flex_shrink_0().text_size(r(12.)).text_color(muted).child(format!("{} · {}", ui::plural(ixs.len(), "session"), claude::usd(cost))))
         });
-        let grid = h_resizable(SharedString::from(format!("mux-row-{key}-{n}"))).children(panels.into_iter().map(|p| resizable_panel().child(div().size_full().p(r(4.)).child(p))));
+        // Panels out of the flow (absolute): the content's width never sets the starting sizes, all start equal.
+        // Named after its sessions: a row of other panels (another view, one closed) starts afresh.
+        let members: String = row.panels.iter().map(|&i| self.slots[i].id.as_str()).collect::<Vec<_>>().join("+");
+        let grid = h_resizable(SharedString::from(format!("mux-row-{key}-{n}-{members}"))).children(panels.into_iter().map(|p| resizable_panel().child(div().absolute().size_full().p(r(4.)).child(p))));
         // A shared project: its leases, each with its forced release.
         let leases = project.as_ref().filter(|_| n == 0 && ixs.len() > 1).map(|p| self.render_leases(p, cx));
         let queue = project.as_ref().filter(|_| n == 0).and_then(|p| self.render_queue(p, cx));
@@ -1203,7 +1277,11 @@ impl Render for MuxView {
                     .into_any_element(),
             );
         }
-        actions.push(button("mux-new").small().primary().icon(IconName::Plus).label("Nouvelle session").disabled(self.form.is_some()).on_click(cx.listener(|this, _, window, cx| this.open_form(window, cx))).into_any_element());
+        actions.push(if self.by_project {
+            button("mux-new").small().primary().icon(IconName::Plus).label("Nouvelle session").disabled(self.form.is_some()).on_click(cx.listener(|this, _, window, cx| this.open_form(window, cx))).into_any_element()
+        } else {
+            self.render_quick_menu(cx)
+        });
         let limits_line = (!limits.is_empty()).then(|| {
             h_flex()
                 .flex_shrink_0()

@@ -2420,7 +2420,7 @@ impl ClaudeSession {
     fn render_empty(&self, cx: &mut Context<Self>) -> Div {
         // A multiplexer panel: one quiet line, the bar above already says where and how it works.
         if !self.opts.chrome {
-            return div().size_full().flex().items_center().justify_center().p(r(16.)).text_size(r(12.5)).text_color(cx.theme().muted_foreground).child("Prête : écrivez-lui ci-dessous ou depuis les Échanges.");
+            return v_flex().size_full().justify_center().p(r(16.)).child(div().w_full().text_center().text_size(r(12.5)).text_color(cx.theme().muted_foreground).child("Prête : écrivez-lui ci-dessous ou depuis les Échanges."));
         }
         let theme = cx.theme();
         let (muted, border, hover) = (theme.muted_foreground, theme.border, ui::hover_bg(cx));
