@@ -93,6 +93,17 @@ pub fn reveal(path: &Path) {
     }
 }
 
+/// `canonicalize`, without the `\\?\` prefix Windows adds (shown everywhere, and some
+/// programs can't read it).
+pub fn canonical(path: &Path) -> std::io::Result<PathBuf> {
+    let p = std::fs::canonicalize(path)?;
+    #[cfg(windows)]
+    if let Some(s) = p.to_str().and_then(|s| s.strip_prefix(r"\\?\")).filter(|s| !s.starts_with("UNC")) {
+        return Ok(PathBuf::from(s));
+    }
+    Ok(p)
+}
+
 /// The home folder (Windows has no HOME).
 pub fn home() -> PathBuf {
     std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).map(PathBuf::from).unwrap_or_else(|| "/".into())

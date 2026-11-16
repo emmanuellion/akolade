@@ -52,7 +52,7 @@ fn main() {
     // Before anything else: it sets the environment (opened from the Finder: the shell's PATH).
     shell_path::import();
     // Optional arguments: a folder (the project) and/or files to open.
-    let args: Vec<PathBuf> = std::env::args().skip(1).map(PathBuf::from).map(|p| p.canonicalize().unwrap_or(p)).collect();
+    let args: Vec<PathBuf> = std::env::args().skip(1).map(PathBuf::from).map(|p| platform::canonical(&p).unwrap_or(p)).collect();
 
     Application::new().with_assets(icons::Assets).run(move |cx: &mut App| {
         gpui_component::init(cx);

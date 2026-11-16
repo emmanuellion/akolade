@@ -121,8 +121,8 @@ pub fn timestamp(s: &str) -> Result<String, String> {
 /// A random version-4 UUID.
 fn uuid_v4() -> String {
     let mut b = [0u8; 16];
-    // shortcut: macOS's /dev/urandom; no fallback, Akolade only runs on macOS for now.
-    let _ = std::fs::File::open("/dev/urandom").and_then(|mut f| std::io::Read::read_exact(&mut f, &mut b));
+    // The system's generator (getrandom on Linux, SecRandom on macOS, BCrypt on Windows).
+    let _ = getrandom::fill(&mut b);
     b[6] = (b[6] & 0x0f) | 0x40;
     b[8] = (b[8] & 0x3f) | 0x80;
     let h: String = b.iter().map(|x| format!("{x:02x}")).collect();

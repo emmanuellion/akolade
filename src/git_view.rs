@@ -487,8 +487,10 @@ fn diff_of(root: &Path, status: &Status, selection: &Selection) -> Option<Vec<Di
 /// The repository path of a file, also when the project was opened through a
 /// symlink (git's top folder is the real path).
 fn repo_path(top: &Path, file: &Path) -> Option<String> {
-    let real = file.canonicalize().unwrap_or_else(|_| file.to_path_buf());
-    real.strip_prefix(top).or_else(|_| file.strip_prefix(top)).ok().map(|p| p.to_string_lossy().into_owned())
+    let real = crate::platform::canonical(file).unwrap_or_else(|_| file.to_path_buf());
+    let rel = real.strip_prefix(top).or_else(|_| file.strip_prefix(top)).ok()?.to_string_lossy().into_owned();
+    // Git's own form ("src/a.rs"), as in `git status`; a backslash is a name character on Unix.
+    Some(if cfg!(windows) { rel.replace('\\', "/") } else { rel })
 }
 
 /// `paths` plus the original path of each rename among them: unstaging only the

@@ -119,10 +119,16 @@ impl Problems {
     }
 }
 
-/// `file:///a%20b/c.py` → `/a b/c.py`.
+/// `file:///a%20b/c.py` → `/a b/c.py`; on Windows `file:///C:/a/c.py` → `C:\a\c.py`.
 pub fn path_of_uri(uri: &str) -> Option<PathBuf> {
-    let path = uri.strip_prefix("file://")?;
-    Some(PathBuf::from(percent_encoding::percent_decode_str(path).decode_utf8().ok()?.into_owned()))
+    path_of_uri_on(uri, cfg!(windows))
+}
+
+fn path_of_uri_on(uri: &str, windows: bool) -> Option<PathBuf> {
+    let path = percent_encoding::percent_decode_str(uri.strip_prefix("file://")?).decode_utf8().ok()?.into_owned();
+    // "/C:/a" → "C:\a" (servers may also write the colon as %3A: decoded above).
+    let drive = windows && path.as_bytes().get(2) == Some(&b':') && path.starts_with('/');
+    Some(PathBuf::from(if drive { path[1..].replace('/', "\\") } else { path }))
 }
 
 /// LSP `textDocument/publishDiagnostics` params → the file and its problems.
@@ -163,6 +169,9 @@ mod tests {
 
     #[test]
     fn lsp_diagnostics_become_problems_without_hints() {
+        assert_eq!(path_of_uri_on("file:///C:/Users/Ada/mon%20projet/a.py", true), Some(PathBuf::from(r"C:\Users\Ada\mon projet\a.py")));
+        assert_eq!(path_of_uri_on("file:///c%3A/p/a.py", true), Some(PathBuf::from(r"c:\p\a.py")));
+        assert_eq!(path_of_uri_on("file:///a%20b/c.py", false), Some(PathBuf::from("/a b/c.py")));
         let params = json!({ "uri": "file:///a%20b/c.py", "diagnostics": [
             { "range": { "start": { "line": 2, "character": 4 }, "end": { "line": 2, "character": 9 } }, "severity": 1, "message": "\"foo\" is not defined ", "source": "basedpyright" },
             { "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 1 } }, "severity": 4, "message": "unused" },

@@ -207,7 +207,8 @@ mod tests {
     }
 
     fn names(ex: &Explorer, ixs: &[usize]) -> Vec<String> {
-        ixs.iter().map(|&ix| ex.entries[ix].rel.to_string_lossy().into_owned()).collect()
+        // With "/" on every system: the expected names read the same.
+        ixs.iter().map(|&ix| ex.entries[ix].rel.to_string_lossy().replace('\\', "/")).collect()
     }
 
     #[test]

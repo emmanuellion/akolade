@@ -35,6 +35,8 @@ base64 = "0.22"
 sha2 = "0.10"
 percent-encoding = "2"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+# The system's random numbers on every OS (UUIDs); already built for gpui's dependencies.
+getrandom = "0.3"
 
 # shortcut: gpui 0.2.2 pulls xattr 0.2.3 (via its http client), which uses libc::ENOATTR,
 # removed from libc 0.2.190 on Linux. Drop this pin when moving to a newer gpui.

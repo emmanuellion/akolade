@@ -236,7 +236,8 @@ mod tests {
         }
         let dir = std::env::temp_dir();
         let out = run(f, &program, &dir.join("a.rs"), &dir, "fn  main( ){let x=1;}".into()).unwrap();
-        assert_eq!(out, "fn main() {\n    let x = 1;\n}\n");
+        // Native line endings: CRLF on Windows.
+        assert_eq!(out.replace("\r\n", "\n"), "fn main() {\n    let x = 1;\n}\n");
         assert!(run(f, &program, &dir.join("a.rs"), &dir, "fn main( {".into()).is_err());
     }
 }

@@ -435,9 +435,10 @@ mod tests {
         let ws = std::env::temp_dir().join(format!("akolade-clippy-ws-{}", std::process::id()));
         std::fs::create_dir_all(ws.join("app/src")).unwrap();
         std::fs::write(ws.join("app/src/lib.rs"), "").unwrap();
+        // Through serde_json: a Windows path's backslashes escaped.
+        let manifest = serde_json::to_string(&ws.join("app/Cargo.toml")).unwrap();
         let out = format!(
-            r#"{{"reason":"compiler-message","manifest_path":"{}","message":{{"level":"warning","message":"m","spans":[{{"file_name":"app/src/lib.rs","is_primary":true,"line_start":1,"line_end":1,"column_start":1,"column_end":2}}]}}}}"#,
-            ws.join("app/Cargo.toml").display()
+            r#"{{"reason":"compiler-message","manifest_path":{manifest},"message":{{"level":"warning","message":"m","spans":[{{"file_name":"app/src/lib.rs","is_primary":true,"line_start":1,"line_end":1,"column_start":1,"column_end":2}}]}}}}"#
         );
         let files = parse_clippy(&out, &ws.join("app/src/lib.rs"), &ws.join("app"));
         assert_eq!(files.keys().collect::<Vec<_>>(), [&ws.join("app/src/lib.rs")]);

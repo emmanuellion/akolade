@@ -51,6 +51,7 @@ dependencies = [
  "chrono",
  "embed-resource",
  "futures",
+ "getrandom 0.3.4",
  "gpui",
  "gpui-component",
  "gpui-component-assets",

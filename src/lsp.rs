@@ -94,9 +94,22 @@ pub fn find_program(program: &str) -> Option<PathBuf> {
 
 /// `file://` URI, percent-encoded.
 pub fn uri(path: &Path) -> String {
+    uri_of(&path.to_string_lossy(), cfg!(windows))
+}
+
+/// `/a b/c.py` → `file:///a%20b/c.py`; on Windows `C:\a\c.py` → `file:///C:/a/c.py`.
+fn uri_of(path: &str, windows: bool) -> String {
+    let path = if windows {
+        // `canonicalize`'s `\\?\C:\…` form, backslashes, and the drive after a slash.
+        let p = path.strip_prefix(r"\\?\").unwrap_or(path).replace('\\', "/");
+        if p.starts_with('/') { p } else { format!("/{p}") }
+    } else {
+        path.to_string()
+    };
     let mut out = String::from("file://");
-    for b in path.to_string_lossy().bytes() {
-        if b.is_ascii_alphanumeric() || b"-._~/".contains(&b) {
+    for (i, b) in path.bytes().enumerate() {
+        // The drive's colon stays as is (`/C:/`): servers expect it.
+        if b.is_ascii_alphanumeric() || b"-._~/".contains(&b) || (windows && b == b':' && i == 2) {
             out.push(b as char);
         } else {
             out.push_str(&format!("%{b:02X}"));
@@ -497,7 +510,9 @@ mod tests {
 
     #[test]
     fn uris_and_positions() {
-        assert_eq!(uri(Path::new("/a b/é.py")), "file:///a%20b/%C3%A9.py");
+        assert_eq!(uri_of("/a b/é.py", false), "file:///a%20b/%C3%A9.py");
+        assert_eq!(uri_of(r"C:\Users\Ada\mon projet\a.py", true), "file:///C:/Users/Ada/mon%20projet/a.py");
+        assert_eq!(uri_of(r"\\?\C:\p\a.py", true), "file:///C:/p/a.py", "canonicalize's prefix");
         // "é" is 1 UTF-16 unit, "😀" is 2.
         assert_eq!(position("ab\né😀x", "ab\né😀".len()), (1, 3));
     }
@@ -527,6 +542,7 @@ mod tests {
         assert!(Arc::ptr_eq(&servers.client(a, &root).unwrap(), &servers.client(b, &root).unwrap()));
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_dead_server_answers_at_once_and_is_not_restarted_on_each_keystroke() {
         let lang = fake_language("false"); // exits immediately
@@ -544,12 +560,14 @@ mod tests {
     }
 
     /// Answers `initialize`, then echoes back all we send (`cat`).
+    #[cfg(unix)]
     fn echo_server(problems: Arc<Problems>) -> Arc<Client> {
         let script = r#"printf 'Content-Length: 20\r\n\r\n{"id":0,"result":{}}'; exec cat"#;
         Client::start(Path::new("/bin/sh"), &["-c", script], Value::Null, &std::env::temp_dir(), problems, "echo").unwrap()
     }
 
     /// Waits until the server has echoed everything sent before.
+    #[cfg(unix)]
     fn barrier(client: &Client) {
         let (tx, rx) = oneshot::channel();
         client.pending.lock().unwrap().insert(999, tx);
@@ -557,6 +575,7 @@ mod tests {
         futures::executor::block_on(rx).unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_stopped_server_posts_no_more_diagnostics() {
         let problems: Arc<Problems> = Arc::default();
@@ -574,6 +593,7 @@ mod tests {
         assert_eq!(problems.of(Path::new("/a.py"))[0].start.0, 1, "ignored once stopped");
     }
 
+    #[cfg(unix)]
     #[test]
     fn closed_files_are_forgotten() {
         let client = echo_server(Arc::default());
