@@ -6,7 +6,7 @@ use std::{
     collections::HashMap,
     io::{self, BufRead, BufReader, Write},
     path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
+    process::{Child, Stdio},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -89,7 +89,7 @@ pub fn servers_dir() -> PathBuf {
 pub fn find_program(program: &str) -> Option<PathBuf> {
     let ours = servers_dir().join("node_modules/.bin");
     let path = std::env::var_os("PATH").unwrap_or_default();
-    std::iter::once(ours).chain(std::env::split_paths(&path)).map(|dir| dir.join(program)).find(|p| p.is_file())
+    std::iter::once(ours).chain(std::env::split_paths(&path)).find_map(|dir| crate::platform::executable_in(&dir, program))
 }
 
 /// `file://` URI, percent-encoded.
@@ -183,7 +183,7 @@ impl Client {
     /// done are queued, so the client is usable right away.
     /// Its diagnostics land in `problems`, under `origin` (its program).
     pub fn start(program: &Path, args: &[&str], options: Value, root: &Path, problems: Arc<Problems>, origin: &'static str) -> io::Result<Arc<Self>> {
-        let mut child = Command::new(program)
+        let mut child = crate::platform::command(program)
             .args(args)
             .current_dir(root)
             .stdin(Stdio::piped())

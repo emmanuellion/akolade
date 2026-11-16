@@ -1,7 +1,7 @@
 //! "Ports ouverts": the programs listening on a TCP port (`lsof`), to open in
 //! the browser or stop.
 
-use std::{process::Command, time::Duration};
+use std::time::Duration;
 
 use gpui::{Context, FontWeight, InteractiveElement, IntoElement, ParentElement, PromptLevel, Render, SharedString, StatefulInteractiveElement, Styled, Task, Window, div, prelude::FluentBuilder};
 use gpui_component::{ActiveTheme, Icon, IconName, Sizable, WindowExt, h_flex, notification::Notification, v_flex};
@@ -46,7 +46,7 @@ pub fn parse_lsof(out: &str) -> Vec<Listener> {
 }
 
 pub fn listeners() -> Result<Vec<Listener>, String> {
-    let out = Command::new("lsof").args(["-nP", "-iTCP", "-sTCP:LISTEN", "-F", "pcn"]).output().map_err(|e| format!("lsof : {e}"))?;
+    let out = crate::platform::command("lsof").args(["-nP", "-iTCP", "-sTCP:LISTEN", "-F", "pcn"]).output().map_err(|e| format!("lsof : {e}"))?;
     // Exit code 1 with no output: nothing listens.
     Ok(parse_lsof(&String::from_utf8_lossy(&out.stdout)))
 }
@@ -114,7 +114,7 @@ impl PortsView {
                 .background_executor()
                 .spawn(async move {
                     let same = listeners().is_ok_and(|list| list.iter().any(|x| (x.pid, x.port, &x.command) == (pid, port, &check)));
-                    same.then(|| Command::new("kill").arg(pid.to_string()).status().is_ok_and(|s| s.success()))
+                    same.then(|| crate::platform::kill(pid))
                 })
                 .await;
             let _ = cx.update(|window, cx| {
@@ -177,7 +177,7 @@ impl Render for PortsView {
                                 .child(div().text_size(r(12.)).text_color(muted).child(format!("PID {} · {}", l.pid, if l.address == "*" { "toutes les adresses".to_string() } else { l.address.clone() }))),
                         )
                         .child(button(SharedString::from(format!("open-{key}"))).outline().small().icon(Icon::new(IconName::ExternalLink)).label("Ouvrir").on_click(move |_, _, _| {
-                            let _ = Command::new("open").arg(format!("http://localhost:{open}")).spawn();
+                            crate::platform::open(format!("http://localhost:{open}"));
                         }))
                         // Akolade's own servers (the preview): stopping one would quit Akolade without asking to save.
                         .when(l.pid != std::process::id(), |d| {

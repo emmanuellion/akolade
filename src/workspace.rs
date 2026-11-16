@@ -6,7 +6,7 @@ use std::{
     path::{Path, PathBuf},
     rc::Rc,
     sync::Arc,
-    process::{Command, Stdio},
+    process::Stdio,
     time::{Duration, SystemTime},
 };
 
@@ -493,7 +493,7 @@ fn expand_run(cmd: &str, file: &Path, env: &HashMap<String, String>) -> String {
 }
 
 fn home() -> PathBuf {
-    std::env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| "/".into())
+    crate::platform::home()
 }
 
 /// Theme color as 8-bit RGB, for the terminal's palette.
@@ -1477,14 +1477,15 @@ impl Workspace {
                 self.servers.stop(program);
             }
         }
+        // The folder made here: `mkdir -p` and `&&` are not PowerShell's.
+        let _ = fs::create_dir_all(lsp::servers_dir());
         let dir = shell_quote(&lsp::servers_dir().to_string_lossy());
-        let command = format!("mkdir -p {dir} && {}", command.replace("{dir}", &dir));
+        let command = command.replace("{dir}", &dir);
         let (name, doing, done) = (plugin.name(), if install { "Installation" } else { "Désinstallation" }, if install { "installé" } else { "désinstallé" });
         window.push_notification(Notification::info(format!("{doing} du plugin {name}…")).id1::<PluginJob>(id).autohide(false), cx);
         // Through the user's shell, interactive and login like the terminal: a
         // Finder-launched app has a bare PATH, without npm or brew.
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
-        let job = cx.background_executor().spawn(async move { Command::new(shell).arg("-ilc").arg(&command).stdin(Stdio::null()).output() });
+        let job = cx.background_executor().spawn(async move { crate::platform::shell_command(&command).stdin(Stdio::null()).output() });
         cx.spawn_in(window, async move |this, cx| {
             let result = job.await;
             let _ = this.update_in(cx, |ws, window, cx| {
@@ -2122,7 +2123,9 @@ impl Workspace {
         match Terminal::spawn(&cwd, terminal_config(cx), on_exit, cx) {
             Ok(mut t) => {
                 self.terminals_made += 1;
-                let shell = std::env::var("SHELL").ok().and_then(|s| s.rsplit('/').next().map(String::from)).unwrap_or_else(|| "sh".into());
+                // "/bin/zsh" → "zsh", "powershell.exe" → "powershell".
+                let shell = crate::platform::default_shell();
+                let shell = shell.rsplit(['/', '\\']).next().unwrap_or("sh").trim_end_matches(".exe").to_string();
                 t.title = format!("{shell} {}", self.terminals_made);
                 self.terminals.push(t);
                 self.active_terminal = self.terminals.len() - 1;
@@ -2300,8 +2303,9 @@ impl Workspace {
         let crumbs = self.crumbs();
         let last = crumbs.len().saturating_sub(1);
 
-        // Past the traffic lights (moved to x = 16 to center them in the taller bar).
-        TitleBar::new().h(r(46.)).pl(px(92.)).child(
+        // Past the traffic lights (moved to x = 16 to center them in the taller bar). Elsewhere
+        // the window buttons are on the right, drawn by TitleBar itself.
+        TitleBar::new().h(r(46.)).pl(px(if cfg!(target_os = "macos") { 92. } else { 12. })).child(
             h_flex()
                 .w_full()
                 .h_full()
@@ -2728,7 +2732,7 @@ impl Workspace {
                 .separator()
                 .item(item("Copier le chemin", |_, p, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(p.display().to_string())), path.clone()))
                 .item(item("Copier le chemin relatif", |_, p, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(p.display().to_string())), rel.clone()))
-                .item(item("Afficher dans le Finder", |_, p, _, _| drop(Command::new("open").arg("-R").arg(&p).spawn()), path.clone()))
+                .item(item(crate::platform::REVEAL_LABEL, |_, p, _, _| crate::platform::reveal(&p), path.clone()))
                 .item(item(if is_dir { "Ouvrir dans le terminal" } else { "Ouvrir son dossier dans le terminal" }, |ws, d, w, cx| ws.run_in_terminal(&format!("cd {}", shell_quote(&d.to_string_lossy())), w, cx), dir.clone()))
         }
     }
@@ -3378,7 +3382,6 @@ impl Render for Workspace {
                     cx.notify();
                 }
             }))
-            .track_focus(&self.focus)
             .on_action(cx.listener(Self::save))
             .on_action(cx.listener(Self::lint_file))
             .on_action(cx.listener(Self::copy_file_path))
@@ -3416,6 +3419,10 @@ impl Render for Workspace {
                 h_flex()
                     .flex_1()
                     .min_h_0()
+                    // Focus is tracked here, below the title bar: a focusable element takes every
+                    // mouse down inside it, and on Windows that keeps the title bar's drag area and
+                    // its minimize/maximize/close buttons from reaching the system.
+                    .track_focus(&self.focus)
                     // Our own sidebar resizing: gpui-component's handle draws a line
                     // that juts out of the card's rounded corners.
                     .on_drag_move(cx.listener(|this, e: &DragMoveEvent<SidebarDrag>, window, cx| {
@@ -3561,6 +3568,7 @@ mod tests {
         assert!(out.ends_with("````\n```js\ninner\n```\n````\n```\nlast\n```\n"), "{}", &out[out.len() - 60..]);
     }
 
+    #[cfg(unix)]
     #[test]
     fn saving_keeps_permissions_symlinks_and_no_leftover() {
         use std::os::unix::fs::{PermissionsExt, symlink};

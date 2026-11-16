@@ -1,3 +1,5 @@
+// Windows: no console window next to the app's (debug builds keep it, for the logs).
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 // serde_json::json! of a whole theme (themes.rs) nests deeper than the default.
 #![recursion_limit = "256"]
 
@@ -12,6 +14,7 @@ mod image_view;
 mod languages;
 mod lint;
 mod lsp;
+mod platform;
 #[cfg(test)]
 mod perf;
 mod plugins;
@@ -102,36 +105,51 @@ fn main() {
         })
         .detach();
 
+        // Never larger than the screen: at 150 % scaling, 1280×820 is taller than a 1080p display.
+        let wanted = size(px(1280.), px(820.));
+        let fit = cx.primary_display().map_or(wanted, |d| {
+            let screen = d.bounds().size;
+            wanted.min(&size(screen.width * 0.9, screen.height * 0.85))
+        });
         let options = WindowOptions {
             // Taller title bar: traffic lights centered in it.
             titlebar: Some(TitlebarOptions { traffic_light_position: Some(point(px(16.), px(16.))), ..TitleBar::title_bar_options() }),
-            window_bounds: Some(WindowBounds::Windowed(Bounds::centered(None, size(px(1280.), px(820.)), cx))),
+            window_bounds: Some(WindowBounds::Windowed(Bounds::centered(None, fit, cx))),
             window_min_size: Some(size(px(720.), px(480.))),
+            // Linux: our own title bar and window buttons (Wayland compositors like GNOME draw none).
+            window_decorations: cfg!(target_os = "linux").then_some(gpui::WindowDecorations::Client),
+            app_id: Some("akolade".into()),
             ..Default::default()
         };
         cx.spawn(async move |cx| {
             cx.open_window(options, |window, cx| {
-                let ws = cx.new(|cx| {
-                    let mut ws = Workspace::new(window, cx);
-                    // No folder given: the last one, if wanted and still there.
-                    let settings = AppSettings::get(cx);
-                    let last = settings.last_folder.clone().filter(|p| settings.reopen_last_folder && p.is_dir());
-                    // Its tabs from last time come back with it (set_root), then the files given.
-                    if let Some(last) = last.filter(|_| !args.iter().any(|p| p.is_dir())) {
-                        ws.set_root(Some(last), window, cx);
-                    }
-                    for p in args {
-                        if p.is_dir() {
-                            ws.set_root(Some(p), window, cx);
-                        } else {
-                            ws.open_path(p, window, cx);
+                // The taskbar's name on Windows and Linux.
+                window.set_window_title("Akolade");
+                let ws = cx.new(|cx| Workspace::new(window, cx));
+                // The folder and files once the window's Root exists: opening them may show a
+                // notification ("file not found"), which needs it.
+                let opening = ws.clone();
+                window.defer(cx, move |window, cx| {
+                    opening.update(cx, |ws, cx| {
+                        // No folder given: the last one, if wanted and still there.
+                        let settings = AppSettings::get(cx);
+                        let last = settings.last_folder.clone().filter(|p| settings.reopen_last_folder && p.is_dir());
+                        // Its tabs from last time come back with it (set_root), then the files given.
+                        if let Some(last) = last.filter(|_| !args.iter().any(|p| p.is_dir())) {
+                            ws.set_root(Some(last), window, cx);
                         }
-                    }
-                    ws
+                        for p in args {
+                            if p.is_dir() {
+                                ws.set_root(Some(p), window, cx);
+                            } else {
+                                ws.open_path(p, window, cx);
+                            }
+                        }
+                        if window.focused(cx).is_none() {
+                            ws.focus.focus(window);
+                        }
+                    });
                 });
-                if window.focused(cx).is_none() {
-                    ws.read(cx).focus.focus(window);
-                }
                 let weak = ws.downgrade();
                 window.on_window_should_close(cx, move |window, cx| {
                     let warn = !weak.update(cx, |ws, _| ws.confirm_window_close()).unwrap_or(true);
@@ -143,8 +161,12 @@ fn main() {
                 // Launched from a terminal, the window would open behind it.
                 cx.activate(true);
                 cx.new(|cx| Root::new(ws, window, cx))
-            })?;
-            anyhow::Ok(())
+            })
+            // No window, no app: say why (Linux without a Vulkan driver…) rather than run invisibly.
+            .unwrap_or_else(|e| {
+                eprintln!("Akolade : impossible d'ouvrir la fenêtre : {e:#}");
+                std::process::exit(1);
+            });
         })
         .detach();
     });

@@ -8,9 +8,8 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fs,
     io::{BufRead, BufReader, Write},
-    os::unix::process::CommandExt,
     path::{Path, PathBuf},
-    process::{Child, ChildStdin, Command, Stdio},
+    process::{Child, ChildStdin, Stdio},
     sync::Mutex,
     thread,
     time::{Duration, SystemTime},
@@ -386,7 +385,7 @@ struct Proc {
 impl Proc {
     /// `settings`: effort, budget and instructions from the "Outils" page.
     fn spawn(program: &Path, root: &Path, model: &str, mode: &str, resume: Option<&str>, settings: &AppSettings) -> std::io::Result<(Proc, mpsc::UnboundedReceiver<Event>)> {
-        let mut cmd = Command::new(program);
+        let mut cmd = crate::platform::command(program);
         cmd.args(["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose", "--include-partial-messages"]);
         // Permission requests come to us on stdin/stdout (the cards' buttons).
         cmd.args(["--permission-prompt-tool", "stdio", "--permission-mode", mode]);
@@ -405,7 +404,8 @@ impl Proc {
         if !settings.claude_instructions.trim().is_empty() {
             cmd.args(["--append-system-prompt", settings.claude_instructions.trim()]);
         }
-        let mut child = cmd.current_dir(root).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).process_group(0).spawn()?;
+        let _child = cmd.current_dir(root).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        let mut child = crate::platform::own_group(&mut cmd).spawn()?;
         let (stdin, stdout, stderr) = (child.stdin.take().expect("piped"), child.stdout.take().expect("piped"), child.stderr.take().expect("piped"));
         let (tx, rx) = mpsc::unbounded();
         let errors = tx.clone();
@@ -435,7 +435,7 @@ impl Drop for Proc {
         let Some(mut child) = self.child.take() else { return };
         // Its commands too (a dev server started by Bash…). A moment to save the
         // conversation (its cost, for the list), then for good.
-        let _ = Command::new("kill").args(["-TERM", "--", &format!("-{}", child.id())]).status();
+        crate::platform::kill_tree(child.id());
         thread::spawn(move || {
             for _ in 0..20 {
                 if let Ok(Some(_)) = child.try_wait() {
@@ -463,7 +463,7 @@ fn permission_response(request: &str, allow: bool, input: &Value) -> Value {
 /// `claude` in PATH, or where its installer puts it (apps opened from the Dock get a short PATH).
 fn find_claude() -> Option<PathBuf> {
     lsp::find_program("claude").or_else(|| {
-        let home = PathBuf::from(std::env::var_os("HOME")?);
+        let home = crate::platform::home();
         [".local/bin/claude", ".claude/local/claude"].into_iter().map(|p| home.join(p)).find(|p| p.is_file())
     })
 }
@@ -487,7 +487,7 @@ pub fn encode(root: &Path) -> String {
 
 // shortcut: very long paths (Claude Code shortens their folder name) are not found; upgrade by matching the `cwd` in the files.
 fn sessions_dir(root: &Path) -> Option<PathBuf> {
-    let config = std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from).or_else(|| Some(PathBuf::from(std::env::var_os("HOME")?).join(".claude")))?;
+    let config = std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from).or_else(|| Some(crate::platform::home().join(".claude")))?;
     let canonical = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     [root, canonical.as_path()].into_iter().map(|p| config.join("projects").join(encode(p))).find(|d| d.is_dir())
 }
@@ -851,7 +851,7 @@ impl ClaudeView {
     /// Where Claude works: the project's folder, `~` for the home folder.
     fn folder(&self) -> String {
         let Some(root) = &self.root else { return String::new() };
-        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let home = Some(crate::platform::home());
         match home.as_deref().and_then(|h| root.strip_prefix(h).ok()) {
             Some(rest) => format!("~/{}", rest.display()),
             None => root.display().to_string(),
@@ -897,9 +897,9 @@ impl ClaudeView {
             .min_w_0()
             .gap(r(4.))
             .child(chip)
-            .child(button(SharedString::from(format!("{id}-finder"))).ghost().xsmall().icon(IconName::ExternalLink).tooltip("Ouvrir dans le Finder").on_click(move |_, _, _| {
+            .child(button(SharedString::from(format!("{id}-finder"))).ghost().xsmall().icon(IconName::ExternalLink).tooltip(format!("Ouvrir dans {}", crate::platform::FILE_MANAGER)).on_click(move |_, _, _| {
                 if let Some(root) = &root {
-                    let _ = Command::new("open").arg(root).spawn();
+                    crate::platform::open(root);
                 }
             }))
             .children(back)

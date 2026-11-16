@@ -10,12 +10,18 @@ permissions:
 
 jobs:
   test:
-    name: Tests (macOS)
-    # Akolade is a macOS app for now (Unix process groups, the Dock, Metal).
-    runs-on: macos-latest
-    timeout-minutes: 45
+    name: Tests (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Linux dependencies
+        if: runner.os == 'Linux'
+        run: scripts/linux-deps.sh
       - run: cargo test --locked

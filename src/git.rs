@@ -4,7 +4,7 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::Stdio,
     sync::Mutex,
 };
 
@@ -101,7 +101,7 @@ fn risky(root: &Path) -> Option<String> {
         return found.clone();
     }
     let read = |args: &[&str]| {
-        let out = Command::new("git").args(args).current_dir(root).env("GIT_OPTIONAL_LOCKS", "0").stdin(Stdio::null()).stderr(Stdio::null()).output().ok()?;
+        let out = crate::platform::command("git").args(args).current_dir(root).env("GIT_OPTIONAL_LOCKS", "0").stdin(Stdio::null()).stderr(Stdio::null()).output().ok()?;
         out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
     };
     // `git config` runs no command; `--includes`: a setting hidden in an included file counts too.
@@ -127,7 +127,7 @@ fn exec(root: &Path, args: &[&str], input: Option<String>, locks: bool) -> Resul
     if let Some(what) = paused(root) {
         return Err(format!("Git est en pause : ce dépôt configure une commande ({what}). Cliquez sur « Mode restreint » en bas de la fenêtre si vous lui faites confiance."));
     }
-    let mut cmd = Command::new("git");
+    let mut cmd = crate::platform::command("git");
     cmd.args(args)
         .current_dir(root)
         // Never wait for a password or an editor nobody can see.
@@ -166,7 +166,7 @@ fn exec(root: &Path, args: &[&str], input: Option<String>, locks: bool) -> Resul
 
 #[cfg(test)]
 pub fn installed() -> bool {
-    Command::new("git").arg("--version").stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok_and(|s| s.success())
+    crate::platform::command("git").arg("--version").stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok_and(|s| s.success())
 }
 
 /// The top folder of the repository holding `root` (None: not in one).
@@ -428,7 +428,7 @@ pub fn line_changes(file: &Path, text: &str) -> Vec<(std::ops::Range<usize>, Lin
     let (a, b) = (tmp.join("a"), tmp.join("b"));
     let ok = std::fs::write(&a, head).and_then(|_| std::fs::write(&b, text)).is_ok();
     // `--no-index` exits 1 when the files differ: its output is what matters.
-    let out = ok.then(|| Command::new("git").args(["diff", "--no-index", "--no-ext-diff", "--no-color", "-U0", "--"]).arg(&a).arg(&b).stdin(Stdio::null()).output().ok()).flatten();
+    let out = ok.then(|| crate::platform::command("git").args(["diff", "--no-index", "--no-ext-diff", "--no-color", "-U0", "--"]).arg(&a).arg(&b).stdin(Stdio::null()).output().ok()).flatten();
     let _ = std::fs::remove_dir_all(&tmp);
     out.map(|o| parse_hunks(&String::from_utf8_lossy(&o.stdout))).unwrap_or_default()
 }
@@ -668,7 +668,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("akolade-git-risky-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
-        let run = |args: &[&str]| Command::new("git").args(args).current_dir(&root).output().unwrap();
+        let run = |args: &[&str]| crate::platform::command("git").args(args).current_dir(&root).output().unwrap();
         run(&["init", "-q"]);
         run(&["config", "core.fsmonitor", "touch pwned"]);
         let err = git(&root, &["status"]).unwrap_err();
@@ -677,7 +677,7 @@ mod tests {
         // A plain repository works as before.
         let plain = root.join("plain");
         std::fs::create_dir_all(&plain).unwrap();
-        Command::new("git").args(["init", "-q"]).current_dir(&plain).output().unwrap();
+        crate::platform::command("git").args(["init", "-q"]).current_dir(&plain).output().unwrap();
         assert!(git(&plain, &["status"]).is_ok());
         let _ = std::fs::remove_dir_all(&root);
     }

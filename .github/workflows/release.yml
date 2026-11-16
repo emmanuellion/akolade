@@ -1,22 +1,31 @@
 name: Release
 
-# Push a tag like v0.2.0 (matching the version in Cargo.toml) on a commit of main to build the
-# macOS app and publish a GitHub release. Run it by hand (main or develop) to only build the
-# package, downloadable from the run page: nothing is published. Releases come from main only.
+# Push a tag like v0.2.0 (matching the version in Cargo.toml) on a commit of main to build every
+# platform and publish a GitHub release. Run it by hand (main or develop) to only build the
+# packages, downloadable from the run page: nothing is published. Releases come from main only.
 on:
   push:
     tags: ['v*']
   workflow_dispatch:
 
-# The build job runs third-party code (crates, dmgbuild): read-only token. Only the release job writes.
+# Build jobs run third-party code (crates, dmgbuild, appimagetool): read-only token. Only the
+# release job writes.
 permissions:
   contents: read
 
 jobs:
   build:
-    name: Build (macOS universal)
-    runs-on: macos-latest
-    timeout-minutes: 75
+    name: Build (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: macos-universal, os: macos-latest }
+          - { target: linux-x86_64, os: ubuntu-22.04, arch: x86_64 }
+          - { target: linux-aarch64, os: ubuntu-22.04-arm, arch: aarch64 }
+          - { target: windows-x86_64, os: windows-latest }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
     defaults:
       run:
         shell: bash
@@ -35,7 +44,7 @@ jobs:
               exit 1
             fi
           elif [[ "$GITHUB_REF" != refs/heads/main && "$GITHUB_REF" != refs/heads/develop ]]; then
-            echo "::error::Le paquet se construit depuis main ou develop, pas depuis $GITHUB_REF_NAME"
+            echo "::error::Les paquets se construisent depuis main ou develop, pas depuis $GITHUB_REF_NAME"
             exit 1
           fi
           version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
@@ -47,16 +56,21 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-apple-darwin,x86_64-apple-darwin
+          targets: ${{ runner.os == 'macOS' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
       - uses: Swatinem/rust-cache@v2
         with:
-          key: macos-universal
+          key: ${{ matrix.target }}
 
-      # Nothing is packaged, let alone published, from code whose tests fail.
+      - name: Linux dependencies
+        if: runner.os == 'Linux'
+        run: scripts/linux-deps.sh
+
+      # Nothing is packaged, let alone published, from code whose tests fail on that system.
       - name: Tests
         run: cargo test --release --locked
 
-      - name: Build (Apple Silicon + Intel)
+      - name: Build macOS (Apple Silicon + Intel)
+        if: runner.os == 'macOS'
         run: |
           cargo build --release --locked --target aarch64-apple-darwin
           cargo build --release --locked --target x86_64-apple-darwin
@@ -65,10 +79,33 @@ jobs:
             target/aarch64-apple-darwin/release/akolade target/x86_64-apple-darwin/release/akolade
           scripts/package-macos.sh dist/akolade "$VERSION" dist
 
+      - name: Build Linux
+        if: runner.os == 'Linux'
+        run: |
+          cargo build --release --locked
+          scripts/package-linux.sh target/release/akolade "$VERSION" "${{ matrix.arch }}" dist
+
+      - name: Build Windows
+        if: runner.os == 'Windows'
+        run: |
+          cargo build --release --locked
+          mkdir -p dist/pkg
+          cp target/release/akolade.exe LICENSE README.md dist/pkg/
+          pwsh -Command "Compress-Archive -Path dist/pkg/* -DestinationPath dist/akolade-$VERSION-windows-x86_64.zip"
+          # Installer (setup.exe) next to the zip. The script finds the exe in target/release itself.
+          choco install innosetup -y --no-progress
+          "/c/Program Files (x86)/Inno Setup 6/ISCC.exe" -Q "-DAppVersion=$VERSION" "-O$(cygpath -w "$PWD/dist")" packaging/windows/akolade.iss
+          test -s "dist/akolade-$VERSION-windows-x86_64-setup.exe"
+
       - uses: actions/upload-artifact@v4
         with:
-          name: akolade-macos-universal
-          path: dist/*.dmg
+          name: akolade-${{ matrix.target }}
+          path: |
+            dist/*.dmg
+            dist/*.AppImage
+            dist/*.tar.gz
+            dist/*.zip
+            dist/*.exe
           if-no-files-found: error
 
   release:

@@ -3,7 +3,7 @@
 
 use std::{
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::Stdio,
     time::Duration,
 };
 
@@ -340,7 +340,7 @@ pub enum Problem {
 }
 
 fn run(program: &Path, root: &Path, args: &[&str]) -> Result<String, String> {
-    let out = Command::new(program)
+    let out = crate::platform::command(program)
         .args(args)
         .current_dir(root)
         // Never wait for an answer nobody can type.
@@ -563,7 +563,7 @@ impl ForgeView {
 
     fn open_web(&self, url: &str, window: &mut Window, cx: &mut Context<Self>) {
         // The address comes from the server: only a web page is handed to `open`.
-        if !(url.starts_with("https://") || url.starts_with("http://")) || Command::new("open").arg(url).spawn().is_err() {
+        if !(url.starts_with("https://") || url.starts_with("http://")) || !crate::platform::open(url) {
             window.push_notification(Notification::error(format!("Impossible d'ouvrir {url}")), cx);
         }
     }

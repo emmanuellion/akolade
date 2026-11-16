@@ -5,7 +5,7 @@
 <h1 align="center">Akolade</h1>
 
 <p align="center">
-  Un éditeur de code natif pour macOS, écrit en Rust.<br>
+  Un éditeur de code natif pour macOS, Windows et Linux, écrit en Rust.<br>
   Git, un terminal, Claude Code et une quinzaine d'outils de développement dans la même fenêtre.
 </p>
 
@@ -62,7 +62,7 @@ Un onglet complet : modifications avec leur diff, indexation, commit, historique
 
 ## Claude Code dans l'éditeur
 
-Si [Claude Code](https://claude.com/code) est installé sur votre Mac, Akolade en fait une conversation dans un onglet. Il utilise votre propre `claude`, avec vos réglages, vos plugins et votre abonnement : Akolade ne voit passer aucune clé.
+Si [Claude Code](https://claude.com/code) est installé sur votre ordinateur, Akolade en fait une conversation dans un onglet. Il utilise votre propre `claude`, avec vos réglages, vos plugins et votre abonnement : Akolade ne voit passer aucune clé.
 
 - **Les réponses arrivent au fil de l'eau**, en Markdown.
 - **Chaque outil utilisé par Claude a sa carte** : la commande lancée, le fichier lu, le diff d'une modification. Un clic ouvre le fichier dans l'éditeur, et les onglets ouverts se rechargent dès que Claude modifie un fichier.
@@ -153,19 +153,26 @@ Les très longues conversations Claude Code restent fluides : seules les cartes 
 | Système | Fichier |
 |---|---|
 | macOS 11 ou plus récent (Apple Silicon et Intel) | [`akolade-macos-universal.dmg`](https://github.com/emmanuellion/akolade/releases/latest/download/akolade-macos-universal.dmg) |
+| Windows 10/11 (x64) | [`akolade-windows-x86_64-setup.exe`](https://github.com/emmanuellion/akolade/releases/latest/download/akolade-windows-x86_64-setup.exe) (installateur) ou [`akolade-windows-x86_64.zip`](https://github.com/emmanuellion/akolade/releases/latest/download/akolade-windows-x86_64.zip) (portable) |
+| Linux (x64 et ARM64) | [`akolade-linux-x86_64.AppImage`](https://github.com/emmanuellion/akolade/releases/latest/download/akolade-linux-x86_64.AppImage), [`akolade-linux-aarch64.AppImage`](https://github.com/emmanuellion/akolade/releases/latest/download/akolade-linux-aarch64.AppImage), ou les `.tar.gz` |
 
-1. Ouvrez le `.dmg` et glissez **Akolade** dans **Applications**.
-2. L'app n'est pas signée par Apple : au premier lancement, macOS refuse de l'ouvrir. Allez dans **Réglages Système › Confidentialité et sécurité**, puis cliquez sur **Ouvrir quand même** en face d'Akolade. Ou, dans un terminal : `xattr -dr com.apple.quarantine /Applications/Akolade.app`.
+**macOS.** Ouvrez le `.dmg` et glissez **Akolade** dans **Applications**. L'app n'est pas signée par Apple : au premier lancement, macOS refuse de l'ouvrir. Allez dans **Réglages Système › Confidentialité et sécurité**, puis cliquez sur **Ouvrir quand même** en face d'Akolade. Ou, dans un terminal : `xattr -dr com.apple.quarantine /Applications/Akolade.app`. Ouverte depuis le Finder ou le Dock, l'app reprend le `PATH` de votre shell : elle trouve Homebrew, Node.js, Claude Code ou Docker comme votre terminal.
 
-Ouverte depuis le Finder ou le Dock, l'app reprend le `PATH` de votre shell : elle trouve Homebrew, Node.js, Claude Code ou Docker comme votre terminal. Chaque version publie aussi `SHA256SUMS.txt` pour vérifier le fichier. Toutes les versions sont sur la [page des releases](https://github.com/emmanuellion/akolade/releases).
+**Windows.** L'installateur installe Akolade pour votre compte, sans droits administrateur, avec un raccourci dans le menu Démarrer. Version portable : dézippez et lancez `akolade.exe`. SmartScreen peut afficher « Windows a protégé votre ordinateur » : cliquez sur **Informations complémentaires › Exécuter quand même**. Le terminal intégré utilise PowerShell.
+
+**Linux.** `chmod +x akolade-linux-*.AppImage` puis lancez-la. Il faut un pilote Vulkan (`mesa-vulkan-drivers` sur Intel et AMD, le pilote propriétaire sur NVIDIA). Si l'AppImage ne démarre pas (FUSE absent), prenez le `.tar.gz`.
+
+Chaque version publie aussi `SHA256SUMS.txt` pour vérifier les fichiers. Toutes les versions sont sur la [page des releases](https://github.com/emmanuellion/akolade/releases).
 
 ### Compiler depuis les sources
 
 **Il vous faut :**
 
-- un Mac (testé sur Apple Silicon avec macOS 27) ;
 - [Rust](https://rustup.rs) 1.85 ou plus récent ;
-- Git (`xcode-select --install`). Xcode lui-même n'est pas nécessaire : les shaders Metal sont compilés au lancement.
+- Git ;
+- macOS : rien d'autre (Xcode n'est pas nécessaire, les shaders Metal sont compilés au lancement) ;
+- Linux : les bibliothèques de gpui, installées par `scripts/linux-deps.sh` sur Debian et Ubuntu ;
+- Windows : les Build Tools de Visual Studio (C++), comme pour tout projet Rust.
 
 **Puis :**
 
@@ -233,7 +240,7 @@ cargo test     # 186 tests ; certains lancent git, cargo ou un serveur de langag
 cargo run      # version de développement
 ```
 
-La CI lance les tests à chaque push sur `main` et `develop`. Pour publier une version : mettre à jour `version` dans `Cargo.toml`, puis pousser un tag `vX.Y.Z` sur un commit de `main`. Le workflow `release.yml` relance les tests, construit l'app universelle (Apple Silicon et Intel), le `.dmg`, et publie la release.
+La CI lance les tests sur macOS, Linux et Windows à chaque push sur `main` et `develop`. Pour publier une version : mettre à jour `version` dans `Cargo.toml`, puis pousser un tag `vX.Y.Z` sur un commit de `main`. Le workflow `release.yml` relance les tests sur chaque système, construit le `.dmg` universel, les AppImage et `.tar.gz` Linux (x64 et ARM64), l'installateur et le `.zip` Windows, puis publie la release.
 
 | Dossier | Contenu |
 |---|---|
@@ -242,6 +249,8 @@ La CI lance les tests à chaque push sur `main` et `develop`. Pour publier une v
 | `src/completion.rs`, `src/lsp.rs` | Complétion intégrée, client des serveurs de langage |
 | `src/git.rs`, `src/git_view.rs` | Appels à git, onglet Git |
 | `src/trust.rs` | Les dossiers de confiance du mode restreint |
+| `src/platform.rs` | Ce qui diffère entre macOS, Linux et Windows : lancer un programme, ouvrir un fichier, la corbeille, le shell |
+| `packaging/`, `scripts/` | Paquets des trois systèmes (.dmg, AppImage, installateur Windows) |
 | `src/themes.rs`, `src/icons.rs` | Thèmes et packs d'icônes |
 | `vendor/` | gpui et gpui-component, avec quelques corrections propres à Akolade, chacune marquée `akolade:` |
 

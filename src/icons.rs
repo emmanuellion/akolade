@@ -62,6 +62,7 @@ pub fn pixmap_frame(pixmap: tiny_skia::Pixmap) -> Frame {
 }
 
 /// Dock icon only (never drawn with `img()`).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const APP_ICON: &str = "icons/app-icon.svg";
 pub const LOGO: &str = "icons/logo.svg";
 pub const FOLDER: &str = "icons/files/folder.svg";

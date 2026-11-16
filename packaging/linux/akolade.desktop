@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Akolade
+GenericName=Éditeur de code
+Comment=Éditeur de code natif : Git, terminal, Claude Code et outils de développement
+Exec=akolade %F
+Icon=akolade
+Terminal=false
+Categories=Development;IDE;TextEditor;
+MimeType=text/plain;inode/directory;
+StartupWMClass=akolade

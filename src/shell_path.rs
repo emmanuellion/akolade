@@ -10,7 +10,7 @@ use std::{
     fs,
     io::Read,
     path::Path,
-    process::{Command, Stdio},
+    process::Stdio,
     time::{Duration, Instant},
 };
 
@@ -27,7 +27,7 @@ pub fn between_marks(out: &str) -> Option<&str> {
 fn from_shell() -> Option<String> {
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
     let script = format!("printf '{MARK}%s{MARK}' \"$PATH\"");
-    let mut child = Command::new(shell).arg("-ilc").arg(script).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().ok()?;
+    let mut child = crate::platform::command(shell).arg("-ilc").arg(script).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().ok()?;
     let started = Instant::now();
     // A stuck shell config (a prompt waiting for input…) must not keep the app from opening.
     while child.try_wait().ok()?.is_none() {
@@ -45,8 +45,9 @@ fn from_shell() -> Option<String> {
 
 /// Call first thing in `main`, before any thread exists (it sets the environment).
 pub fn import() {
-    // From a terminal, the PATH is already the user's own.
-    if std::env::var_os("TERM").is_some() {
+    // From a terminal, the PATH is already the user's own. Linux desktops start apps with the
+    // session's PATH, and Windows apps get the system's: only macOS needs this.
+    if !cfg!(target_os = "macos") || std::env::var_os("TERM").is_some() {
         return;
     }
     let cache = crate::settings::app_dir().join("shell-path");

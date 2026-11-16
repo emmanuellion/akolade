@@ -3,7 +3,7 @@
 use std::{
     ops::Range,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::Stdio,
     rc::Rc,
     sync::atomic::{AtomicUsize, Ordering},
     time::Duration,
@@ -64,7 +64,7 @@ pub fn diff(left: &str, right: &str, ignore_space: bool) -> Result<Vec<DiffLine>
     }
     let out = written
         .map_err(|e| e.to_string())
-        .and_then(|_| Command::new("git").args(&args).arg("--").arg(&a).arg(&b).current_dir(&tmp).stdin(Stdio::null()).output().map_err(|e| format!("git introuvable : {e}")));
+        .and_then(|_| crate::platform::command("git").args(&args).arg("--").arg(&a).arg(&b).current_dir(&tmp).stdin(Stdio::null()).output().map_err(|e| format!("git introuvable : {e}")));
     let _ = std::fs::remove_dir_all(&tmp);
     let out = out?;
     // `--no-index` exits 1 when the texts differ.

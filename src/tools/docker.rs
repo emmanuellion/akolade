@@ -1,7 +1,7 @@
 //! "Docker": the containers (`docker ps -a`), grouped by Compose project, with
 //! start / stop / restart / remove, and logs or a shell in the terminal.
 
-use std::{process::Command, time::Duration};
+use std::time::Duration;
 
 use gpui::{
     Context, FontWeight, Hsla, InteractiveElement, IntoElement, ParentElement, PromptLevel, Render, SharedString, StatefulInteractiveElement, Styled, Task, WeakEntity, Window, div,
@@ -76,7 +76,7 @@ pub fn parse_ps(out: &str) -> Vec<Container> {
 }
 
 fn docker(args: &[&str]) -> Result<String, String> {
-    let out = Command::new("docker").args(args).output().map_err(|e| format!("docker : {e}"))?;
+    let out = crate::platform::command("docker").args(args).output().map_err(|e| format!("docker : {e}"))?;
     if out.status.success() {
         return Ok(String::from_utf8_lossy(&out.stdout).into_owned());
     }

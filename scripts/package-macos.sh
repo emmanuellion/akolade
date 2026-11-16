@@ -12,8 +12,8 @@ sed "s/@VERSION@/$version/g" packaging/macos/Info.plist > "$app/Contents/Info.pl
 iconset="$(mktemp -d)/akolade.iconset"
 mkdir -p "$iconset"
 for s in 16 32 128 256 512; do
-  sips -z $s $s packaging/macos/icon.png --out "$iconset/icon_${s}x${s}.png" >/dev/null
-  sips -z $((s * 2)) $((s * 2)) packaging/macos/icon.png --out "$iconset/icon_${s}x${s}@2x.png" >/dev/null
+  sips -z $s $s packaging/icon.png --out "$iconset/icon_${s}x${s}.png" >/dev/null
+  sips -z $((s * 2)) $((s * 2)) packaging/icon.png --out "$iconset/icon_${s}x${s}@2x.png" >/dev/null
 done
 iconutil -c icns "$iconset" -o "$app/Contents/Resources/akolade.icns"
 

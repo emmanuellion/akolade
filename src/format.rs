@@ -4,7 +4,7 @@
 use std::{
     io::Write,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::Stdio,
 };
 
 use crate::{lsp, settings::AppSettings};
@@ -144,7 +144,7 @@ pub fn run(f: &Formatter, program: &Path, file: &Path, root: &Path, text: String
     let edition = if f.args.contains(&"{edition}") { rust_edition(file) } else { String::new() };
     let file = file.to_string_lossy();
     let args: Vec<String> = f.args.iter().map(|a| a.replace("{file}", &file).replace("{edition}", &edition)).collect();
-    let mut child = Command::new(program)
+    let mut child = crate::platform::command(program)
         .args(&args)
         .current_dir(root)
         .stdin(Stdio::piped())
@@ -230,6 +230,10 @@ mod tests {
     fn rustfmt_formats_through_stdin() {
         let f = FORMATTERS.iter().find(|f| f.name == "rustfmt").unwrap();
         let Some(program) = lsp::find_program(f.program) else { return };
+        // rustup's proxy without its rustfmt component: not installed either.
+        if !crate::platform::command(&program).arg("--version").output().is_ok_and(|o| o.status.success()) {
+            return;
+        }
         let dir = std::env::temp_dir();
         let out = run(f, &program, &dir.join("a.rs"), &dir, "fn  main( ){let x=1;}".into()).unwrap();
         assert_eq!(out, "fn main() {\n    let x = 1;\n}\n");

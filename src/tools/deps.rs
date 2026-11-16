@@ -6,7 +6,7 @@ use std::{
     collections::HashMap,
     fs,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::Stdio,
 };
 
 use gpui::{
@@ -705,7 +705,7 @@ fn program(name: &str, hint: &str) -> Result<PathBuf, Note> {
 /// The tool's stdout. These tools exit with an error when they find something: their JSON still counts.
 fn run(dir: &Path, program: &Path, args: &[&str], envs: &[(&str, PathBuf)]) -> Result<String, String> {
     let name = program.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
-    let out = Command::new(program)
+    let out = crate::platform::command(program)
         .args(args)
         .current_dir(dir)
         .envs(envs.iter().map(|(k, v)| (k, v)))

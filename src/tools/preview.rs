@@ -7,7 +7,6 @@ use std::{
     io::{self, BufRead, BufReader, Write},
     net::{TcpListener, TcpStream},
     path::{Component, Path, PathBuf},
-    process::Command,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering::Relaxed},
@@ -245,7 +244,7 @@ fn handle(stream: TcpStream, s: &Shared) -> io::Result<()> {
 }
 
 fn open(url: &str) {
-    let _ = Command::new("open").arg(url).spawn();
+    crate::platform::open(url);
 }
 
 pub struct PreviewView {
@@ -425,6 +424,7 @@ mod tests {
         assert_eq!(ct("Makefile"), "application/octet-stream");
     }
 
+    #[cfg(unix)]
     #[test]
     fn paths_outside_the_root_are_refused() {
         let base = temp("escape");

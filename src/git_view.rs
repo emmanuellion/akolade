@@ -1321,6 +1321,7 @@ mod tests {
         assert_eq!(with_origins(&changes, vec!["b é.txt".into(), "x".into()]), ["b é.txt", "x", "a é.txt"]);
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_file_reached_through_a_symlink_has_its_repository_path() {
         let dir = std::env::temp_dir().join(format!("akolade-gitview-{}", std::process::id()));

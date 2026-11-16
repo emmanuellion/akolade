@@ -5,7 +5,7 @@ use std::{
     fs,
     io::{Read, Write},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::Stdio,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -71,7 +71,7 @@ pub fn send(method: &str, url: &str, headers: &str, body: &str, timeout: u64) ->
 
 fn run_curl(dir: &Path, method: &str, url: &str, headers: &str, body: &str, timeout: u64) -> Result<Response, String> {
     let (head, out) = (dir.join("head"), dir.join("body"));
-    let mut cmd = Command::new("curl");
+    let mut cmd = crate::platform::command("curl");
     cmd.args(["-sS", "--max-time", &timeout.to_string(), "-X", method, "-D"]).arg(&head).arg("-o").arg(&out).args(["-w", "%{http_code} %{time_total} %{size_download}"]);
     for line in headers.lines().map(str::trim).filter(|l| l.contains(':')) {
         cmd.arg("-H").arg(line);

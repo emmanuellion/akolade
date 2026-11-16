@@ -3,6 +3,10 @@ name = "akolade"
 version = "0.1.0"
 edition = "2024"
 
+# Windows: the app icon inside akolade.exe (build.rs). Already a build dependency of GPUI.
+[target.'cfg(windows)'.build-dependencies]
+embed-resource = "3.0"
+
 [dependencies]
 # runtime_shaders: no Xcode needed (Metal shaders compiled at launch).
 gpui = { version = "0.2.2", features = ["runtime_shaders"] }
@@ -32,6 +36,11 @@ sha2 = "0.10"
 percent-encoding = "2"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 
+# shortcut: gpui 0.2.2 pulls xattr 0.2.3 (via its http client), which uses libc::ENOATTR,
+# removed from libc 0.2.190 on Linux. Drop this pin when moving to a newer gpui.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "=0.2.189"
+
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
 objc2-foundation = { version = "0.3", features = ["NSData"] }
@@ -60,3 +69,7 @@ opt-level = 3
 # typing cost 42 % CPU (17 %); rebuilds take ~3 s longer.
 [profile.dev.package.akolade]
 opt-level = 1
+
+# Distributed builds: no debug symbols, a smaller download.
+[profile.release]
+strip = true

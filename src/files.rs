@@ -3,7 +3,6 @@
 use std::{
     fs, io,
     path::{Path, PathBuf},
-    process::Command,
 };
 
 /// A file or folder name typed by the user. Err: why not.
@@ -29,14 +28,12 @@ pub fn target(dir: &Path, name: &str) -> Result<PathBuf, String> {
 /// → "README.md") is allowed: on macOS's case-insensitive disks the new name
 /// already "exists", as the same file.
 pub fn rename(from: &Path, name: &str) -> Result<PathBuf, String> {
-    use std::os::unix::fs::MetadataExt;
     let dir = from.parent().unwrap_or(Path::new("/"));
     let to = match target(dir, name) {
         Ok(to) => to,
         Err(e) => {
             let to = dir.join(check_name(name)?);
-            let same = |p: &Path| fs::symlink_metadata(p).map(|m| (m.dev(), m.ino()));
-            if same(&to).ok() != same(from).ok() {
+            if !same_file(&to, from) {
                 return Err(e);
             }
             to
@@ -44,6 +41,20 @@ pub fn rename(from: &Path, name: &str) -> Result<PathBuf, String> {
     };
     fs::rename(from, &to).map_err(|e| e.to_string())?;
     Ok(to)
+}
+
+/// The same file under two names (only the case differs, on a case-insensitive disk).
+#[cfg(unix)]
+fn same_file(a: &Path, b: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let id = |p: &Path| fs::symlink_metadata(p).map(|m| (m.dev(), m.ino())).ok();
+    id(a).is_some() && id(a) == id(b)
+}
+
+/// Windows disks ignore the case: same folder, same name but for the case.
+#[cfg(windows)]
+fn same_file(a: &Path, b: &Path) -> bool {
+    a.parent() == b.parent() && a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase()
 }
 
 /// Moves `from` into the folder `to_dir` (drag and drop). Err if it would go
@@ -78,7 +89,11 @@ fn copy_all(from: &Path, to: &Path) -> io::Result<()> {
     // A link stays a link: following one to a parent folder would copy forever.
     let kind = fs::symlink_metadata(from)?.file_type();
     if kind.is_symlink() {
+        #[cfg(unix)]
         return std::os::unix::fs::symlink(fs::read_link(from)?, to);
+        // shortcut: Windows needs a privilege to create links; the link is left out of the copy.
+        #[cfg(windows)]
+        return Ok(());
     }
     // A named pipe or socket: reading it would wait forever, and it holds no content.
     if !kind.is_file() && !kind.is_dir() {
@@ -103,19 +118,9 @@ pub fn duplicate(path: &Path) -> io::Result<PathBuf> {
     Ok(to)
 }
 
-/// To the macOS Trash (it can be put back from there), never deleted for good.
+/// To the system's trash (it can be put back from there), never deleted for good.
 pub fn trash(path: &Path) -> Result<(), String> {
-    // macOS 14+ has `trash`: Finder's own "Put Back" then works.
-    if Path::new("/usr/bin/trash").exists() {
-        let out = Command::new("/usr/bin/trash").arg(path).output().map_err(|e| e.to_string())?;
-        if out.status.success() {
-            return Ok(());
-        }
-    }
-    let bin = PathBuf::from(std::env::var("HOME").map_err(|e| e.to_string())?).join(".Trash");
-    let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
-    let to = (1..).map(|n| bin.join(if n == 1 { name.clone() } else { format!("{name} {n}") })).find(|p| fs::symlink_metadata(p).is_err()).expect("a free name");
-    fs::rename(path, &to).map_err(|e| e.to_string())
+    crate::platform::trash(path)
 }
 
 #[cfg(test)]
@@ -154,6 +159,7 @@ mod tests {
         fs::remove_dir_all(d).unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn duplicating_keeps_links_as_links() {
         let d = dir("links");
@@ -161,7 +167,7 @@ mod tests {
         fs::write(d.join("app/a.txt"), "x").unwrap();
         // A link back to its own folder: followed, the copy would never end.
         std::os::unix::fs::symlink("..", d.join("app/up")).unwrap();
-        assert!(Command::new("mkfifo").arg(d.join("app/pipe")).status().unwrap().success());
+        assert!(crate::platform::command("mkfifo").arg(d.join("app/pipe")).status().unwrap().success());
         let copy = duplicate(&d.join("app")).unwrap();
         assert_eq!(fs::read_link(copy.join("up")).unwrap(), Path::new(".."));
         assert!(!copy.join("pipe").exists(), "a pipe is skipped, not read forever");

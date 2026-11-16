@@ -23,8 +23,16 @@ impl Write for PtyWriter {
 }
 
 /// The terminal's foreground process group is not the shell's.
+#[cfg(unix)]
 fn foreground_busy(master: &dyn MasterPty, shell: &dyn Child) -> bool {
     matches!((master.process_group_leader(), shell.process_id()), (Some(leader), Some(shell)) if leader as u32 != shell)
+}
+
+// shortcut: Windows' ConPTY tells no foreground process: a command is always typed in; upgrade by
+// walking the shell's child processes.
+#[cfg(windows)]
+fn foreground_busy(_: &dyn MasterPty, _: &dyn Child) -> bool {
+    false
 }
 
 pub struct Terminal {
@@ -52,8 +60,7 @@ impl Terminal {
         let size = PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 };
         let pair = native_pty_system().openpty(size)?;
 
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
-        let mut cmd = CommandBuilder::new(shell);
+        let mut cmd = CommandBuilder::new(crate::platform::default_shell());
         cmd.cwd(cwd);
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
@@ -90,7 +97,7 @@ impl Terminal {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::time::Duration;
@@ -99,8 +106,9 @@ mod tests {
     #[test]
     fn a_running_program_makes_the_terminal_busy() {
         let pair = native_pty_system().openpty(PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 }).unwrap();
-        let mut cmd = CommandBuilder::new("/bin/zsh");
-        cmd.args(["-f", "-i"]);
+        // /bin/sh: there on every Unix (zsh is not, on Linux).
+        let mut cmd = CommandBuilder::new("/bin/sh");
+        cmd.arg("-i");
         let mut child = pair.slave.spawn_command(cmd).unwrap();
         let mut writer = pair.master.take_writer().unwrap();
         let mut reader = pair.master.try_clone_reader().unwrap();

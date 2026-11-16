@@ -2,7 +2,7 @@
 //! context, with logs, a shell, `describe` or port-forward in the terminal,
 //! and delete / restart / scale after a confirmation.
 
-use std::{ffi::OsStr, process::Command, time::Duration};
+use std::{ffi::OsStr, time::Duration};
 
 use chrono::{DateTime, Utc};
 use gpui::{
@@ -342,7 +342,7 @@ pub fn explain(stderr: &str) -> String {
 }
 
 fn kubectl<S: AsRef<OsStr>>(args: &[S]) -> Result<String, String> {
-    let out = Command::new("kubectl").args(args).output().map_err(|e| format!("kubectl : {e}"))?;
+    let out = crate::platform::command("kubectl").args(args).output().map_err(|e| format!("kubectl : {e}"))?;
     if out.status.success() { Ok(String::from_utf8_lossy(&out.stdout).into_owned()) } else { Err(explain(&String::from_utf8_lossy(&out.stderr))) }
 }
 

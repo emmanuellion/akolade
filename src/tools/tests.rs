@@ -4,9 +4,8 @@
 use std::{
     collections::{HashMap, HashSet},
     fs,
-    os::unix::process::CommandExt,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::Stdio,
     sync::{
         Arc,
         atomic::{AtomicU32, Ordering},
@@ -463,7 +462,7 @@ pub fn parse_jest(json: &str, root: &Path) -> Vec<TestCase> {
 /// SIGTERM to the run's whole process group (cargo and its test binaries, npx and node…).
 fn kill_group(pid: u32) {
     if pid != 0 {
-        let _ = Command::new("kill").args(["-TERM", "--", &format!("-{pid}")]).status();
+        crate::platform::kill_tree(pid);
     }
 }
 
@@ -473,15 +472,9 @@ pub fn execute(runner: Runner, root: &Path, failed: &[TestCase], pid: &AtomicU32
     let out = std::env::temp_dir().join(format!("akolade-tests-{}-{nanos}", std::process::id()));
     let argv = command(runner, root, &out, failed);
     let start = Instant::now();
-    let child = Command::new(&argv[0])
-        .args(&argv[1..])
-        .current_dir(root)
-        .env("NO_COLOR", "1")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .process_group(0)
-        .spawn();
+    let mut cmd = crate::platform::command(&argv[0]);
+    cmd.args(&argv[1..]).current_dir(root).env("NO_COLOR", "1").stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let child = crate::platform::own_group(&mut cmd).spawn();
     let output = child.and_then(|child| {
         pid.store(child.id(), Ordering::Relaxed);
         child.wait_with_output()
@@ -890,10 +883,14 @@ tests/test_math.py:9: AssertionError</failure></testcase><testcase classname="te
         let _ = fs::remove_dir_all(&dir);
     }
 
+    #[cfg(unix)]
     #[test]
     fn stop_kills_the_whole_process_group() {
         // A shell and its own child, like cargo and a test binary.
-        let child = Command::new("sh").args(["-c", "sleep 30; true"]).stdout(Stdio::piped()).process_group(0).spawn().unwrap();
+        let child = crate::platform::own_group(crate::platform::command("sh").args(["-c", "sleep 30; true"]).stdout(Stdio::piped())).spawn().unwrap();
+        // Once the shell has started its child, as when a run is stopped (a slow CI machine
+        // may not have forked `sleep` yet right after the spawn).
+        std::thread::sleep(std::time::Duration::from_millis(300));
         let start = Instant::now();
         kill_group(child.id());
         let _ = child.wait_with_output();

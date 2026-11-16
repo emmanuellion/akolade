@@ -6,7 +6,7 @@ use std::{
     io::{BufRead, BufReader},
     ops::Range,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::Stdio,
 };
 
 use gpui::{
@@ -178,9 +178,9 @@ fn immutable_uri(db: &Path) -> String {
 }
 
 fn run_sqlite(db: &std::ffi::OsStr, sql: &str, write: bool, max: usize) -> Result<Table, String> {
-    let mut cmd = Command::new("sqlite3");
+    let mut cmd = crate::platform::command("sqlite3");
     // -safe: no .shell, ATTACH or extension from a query; -init: ~/.sqliterc can't change the output.
-    cmd.args(["-init", "/dev/null", "-safe", "-json"]);
+    cmd.args(["-init", crate::platform::NULL_DEVICE, "-safe", "-json"]);
     if !write {
         cmd.arg("-readonly");
     }
@@ -652,12 +652,16 @@ mod tests {
 
     #[test]
     fn reads_and_changes_a_real_database() {
+        // End to end with the sqlite3 program: skipped where it is not installed.
+        if crate::lsp::find_program("sqlite3").is_none() {
+            return;
+        }
         let dir = std::env::temp_dir().join(format!("akolade-db-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let db = dir.join("app.sqlite");
         let setup = "CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT, note TEXT); INSERT INTO users(name, note) VALUES ('Ada', NULL), ('Bob \"B\"', 'x'); CREATE VIEW named AS SELECT name FROM users; CREATE TABLE \"we\"\"ird\"(v);";
-        assert!(Command::new("sqlite3").arg(&db).arg(setup).status().unwrap().success());
+        assert!(crate::platform::command("sqlite3").arg(&db).arg(setup).status().unwrap().success());
 
         let list = tables(&db).unwrap();
         assert_eq!(
@@ -691,11 +695,15 @@ mod tests {
 
     #[test]
     fn reads_a_wal_database_without_its_side_files_and_creates_none() {
+        // End to end with the sqlite3 program: skipped where it is not installed.
+        if crate::lsp::find_program("sqlite3").is_none() {
+            return;
+        }
         let dir = std::env::temp_dir().join(format!("akolade-wal-{}", std::process::id())).join("a b#c");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let db = dir.join("r%g.db");
-        assert!(Command::new("sqlite3").arg(&db).arg("PRAGMA journal_mode=WAL; CREATE TABLE t(x); INSERT INTO t VALUES (1);").stdout(Stdio::null()).status().unwrap().success());
+        assert!(crate::platform::command("sqlite3").arg(&db).arg("PRAGMA journal_mode=WAL; CREATE TABLE t(x); INSERT INTO t VALUES (1);").stdout(Stdio::null()).status().unwrap().success());
         // As a copied or freshly checkpointed database: no "-shm" nor "-wal".
         for s in ["-shm", "-wal"] {
             let _ = std::fs::remove_file(side_file(&db, s));

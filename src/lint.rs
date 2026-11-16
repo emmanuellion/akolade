@@ -6,7 +6,7 @@ use std::{
     collections::{HashMap, HashSet},
     io::Write,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::Stdio,
     sync::Mutex,
 };
 
@@ -140,7 +140,7 @@ fn program(l: &Linter, root: &Path, trusted: bool) -> Option<PathBuf> {
 pub fn run(l: &Linter, program: &Path, file: &Path, root: &Path, text: &str) -> HashMap<PathBuf, Vec<Problem>> {
     let file_arg = file.to_string_lossy();
     let args: Vec<String> = l.args.iter().map(|a| a.replace("{file}", &file_arg)).collect();
-    let mut cmd = Command::new(program);
+    let mut cmd = crate::platform::command(program);
     cmd.args(&args).current_dir(root).stdout(Stdio::piped()).stderr(Stdio::null());
     cmd.stdin(if l.project { Stdio::null() } else { Stdio::piped() });
     let Ok(mut child) = cmd.spawn() else { return HashMap::new() };

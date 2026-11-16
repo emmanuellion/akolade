@@ -43,9 +43,11 @@ pub fn read_json<T: serde::de::DeserializeOwned + Default>(path: &Path) -> T {
 }
 
 pub fn app_dir() -> PathBuf {
-    let home = PathBuf::from(std::env::var("HOME").unwrap_or_default());
+    let home = crate::platform::home();
     if cfg!(target_os = "macos") {
         home.join("Library/Application Support/Akolade")
+    } else if cfg!(windows) {
+        std::env::var_os("APPDATA").map(PathBuf::from).unwrap_or_else(|| home.join("AppData/Roaming")).join("Akolade")
     } else {
         std::env::var("XDG_DATA_HOME").map(PathBuf::from).unwrap_or_else(|_| home.join(".local/share")).join("akolade")
     }
@@ -337,7 +339,7 @@ impl Render for SettingsView {
                 )
                 .when(folders.is_empty(), |d| d.child(div().text_size(r(12.5)).text_color(muted).child("Aucun pour l'instant.")))
                 .children(folders.into_iter().enumerate().map(|(i, folder)| {
-                    let shown = folder.display().to_string().replacen(&std::env::var("HOME").unwrap_or_default(), "~", 1);
+                    let shown = folder.display().to_string().replacen(&crate::platform::home().display().to_string(), "~", 1);
                     h_flex()
                         .gap(r(8.))
                         .child(div().flex_1().min_w_0().truncate().font_family(mono.clone()).text_size(r(12.5)).child(shown))
