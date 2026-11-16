@@ -845,7 +845,9 @@ mod tests {
 
     #[test]
     fn terminal_commands_name_the_context() {
-        assert_eq!(kubectl_line("prod's", "logs -n 'a' 'b'"), r"kubectl --context='prod'\''s' logs -n 'a' 'b'");
+        // Quoted for the terminal's shell: PowerShell on Windows, a POSIX shell elsewhere.
+        let context = if cfg!(windows) { "'prod''s'" } else { r"'prod'\''s'" };
+        assert_eq!(kubectl_line("prod's", "logs -n 'a' 'b'"), format!("kubectl --context={context} logs -n 'a' 'b'"));
     }
 
     const PODS: &str = r#"{

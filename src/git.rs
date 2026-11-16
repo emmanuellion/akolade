@@ -834,6 +834,8 @@ mod tests {
         std::fs::create_dir_all(root.join("sub")).unwrap();
         let g = |args: &[&str]| git(&root, args).unwrap();
         g(&["init", "-q", "-b", "main"]);
+        // Windows runners check out with CRLF (core.autocrlf): the bytes written are the ones compared.
+        g(&["config", "core.autocrlf", "false"]);
         std::fs::write(root.join("sub/a.txt"), "one\n").unwrap();
         std::fs::write(root.join("sub/gone.txt"), "x").unwrap();
         g(&["add", "sub/a.txt"]);
@@ -869,6 +871,7 @@ mod tests {
         g(&repo, &["init", "-q", "-b", "main"]);
         g(&repo, &["config", "user.email", "test@example.com"]);
         g(&repo, &["config", "user.name", "Test"]);
+        g(&repo, &["config", "core.autocrlf", "false"]);
         std::fs::write(repo.join("a.txt"), "un\ndeux\ntrois\n").unwrap();
         g(&repo, &["add", "."]);
         g(&repo, &["commit", "-qm", "init"]);
