@@ -399,6 +399,12 @@ mod tests {
             eprintln!("skipped: akolade not built above {}", exe.display());
             return;
         };
+        // Built before this test: an older akolade without `mcp-coord` would open the editor and never answer.
+        let modified = |p: &std::path::Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+        if modified(&bin) < modified(&exe) {
+            eprintln!("skipped: {} is older than this test (cargo build first)", bin.display());
+            return;
+        }
         coord::with(|c| c.add(session("stdio-test", "/s")));
         let e = endpoint();
         let mut child = Command::new(&bin)
