@@ -663,7 +663,12 @@ impl Workspace {
         if let Some(root) = &root {
             self.explorer.load(root, &AppSettings::get(cx).scan_options());
             let last = root.clone();
-            AppSettings::update(cx, |s| s.last_folder = Some(last));
+            AppSettings::update(cx, |s| {
+                s.recent_folders.retain(|p| *p != last);
+                s.recent_folders.insert(0, last.clone());
+                s.recent_folders.truncate(12);
+                s.last_folder = Some(last);
+            });
             if let Ok(s) = fs::read_to_string(root.join("akolade.json")) {
                 match serde_json::from_str(&s) {
                     Ok(c) => self.config = c,

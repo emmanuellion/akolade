@@ -107,7 +107,8 @@ struct Proc {
 
 impl Proc {
     /// `settings`: effort, budget and instructions from the "Outils" page.
-    fn spawn(program: &Path, root: &Path, model: &str, mode: &str, resume: Option<&str>, settings: &AppSettings) -> std::io::Result<(Proc, mpsc::UnboundedReceiver<Event>)> {
+    /// `opts`: a session's own effort, budget, instructions and arguments, over the settings'.
+    fn spawn(program: &Path, root: &Path, model: &str, mode: &str, resume: Option<&str>, settings: &AppSettings, opts: &SessionOptions) -> std::io::Result<(Proc, mpsc::UnboundedReceiver<Event>)> {
         let mut cmd = crate::platform::command(program);
         // `--replay-user-messages`: a message sent while Claude works says when it is taken.
         cmd.args(["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose", "--include-partial-messages", "--replay-user-messages"]);
@@ -119,17 +120,22 @@ impl Proc {
         if let Some(id) = resume {
             cmd.args(["--resume", id]);
         }
-        if !settings.claude_effort.is_empty() {
-            cmd.args(["--effort", &settings.claude_effort]);
+        let effort = opts.effort.as_deref().unwrap_or(&settings.claude_effort);
+        if !effort.is_empty() {
+            cmd.args(["--effort", effort]);
         }
-        if settings.claude_budget > 0. {
-            cmd.args(["--max-budget-usd", &settings.claude_budget.to_string()]);
+        let budget = opts.budget.unwrap_or(settings.claude_budget);
+        if budget > 0. {
+            cmd.args(["--max-budget-usd", &budget.to_string()]);
         }
-        if !settings.claude_instructions.trim().is_empty() {
-            cmd.args(["--append-system-prompt", settings.claude_instructions.trim()]);
+        let prompt = [settings.claude_instructions.trim(), opts.system_prompt.trim()].into_iter().filter(|p| !p.is_empty()).collect::<Vec<_>>().join("\n\n");
+        if !prompt.is_empty() {
+            cmd.args(["--append-system-prompt", &prompt]);
         }
+        cmd.args(&opts.extra_args);
         let _child = cmd.current_dir(root).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
         let mut child = crate::platform::own_group(&mut cmd).spawn()?;
+        RUNNING.lock().unwrap_or_else(|e| e.into_inner()).push(child.id());
         let (stdin, stdout, stderr) = (child.stdin.take().expect("piped"), child.stdout.take().expect("piped"), child.stderr.take().expect("piped"));
         let (tx, rx) = mpsc::unbounded();
         let errors = tx.clone();
@@ -154,9 +160,20 @@ impl Proc {
     }
 }
 
+/// Every `claude` running, for `kill_all` (Akolade quitting may not drop the views).
+static RUNNING: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+
+/// Akolade quits: each `claude` and what it started stops with it.
+pub fn kill_all() {
+    for pid in std::mem::take(&mut *RUNNING.lock().unwrap_or_else(|e| e.into_inner())) {
+        crate::platform::kill_tree(pid);
+    }
+}
+
 impl Drop for Proc {
     fn drop(&mut self) {
         let Some(mut child) = self.child.take() else { return };
+        RUNNING.lock().unwrap_or_else(|e| e.into_inner()).retain(|&pid| pid != child.id());
         // Its commands too (a dev server started by Bash…). A moment to save the
         // conversation (its cost, for the list), then for good.
         crate::platform::kill_tree(child.id());
@@ -640,12 +657,21 @@ pub struct SessionOptions {
     pub chrome: bool,
     /// Follows the folder open in the editor (the tab); else stays in its own.
     pub follow_editor: bool,
+    /// Its own model, mode, effort and budget (a multiplexer session): the settings'
+    /// apply at its start only, later changes there leave it alone.
+    pub own_settings: bool,
+    pub effort: Option<String>,
+    pub budget: Option<f64>,
+    /// Added to the settings' instructions (`--append-system-prompt`).
+    pub system_prompt: String,
+    /// More arguments for `claude` (`--mcp-config`, `--allowedTools`…).
+    pub extra_args: Vec<String>,
 }
 
 impl SessionOptions {
     /// The Claude Code tab.
     pub fn tab() -> Self {
-        Self { chrome: true, follow_editor: true }
+        Self { chrome: true, follow_editor: true, own_settings: false, effort: None, budget: None, system_prompt: String::new(), extra_args: vec![] }
     }
 }
 
@@ -816,7 +842,7 @@ impl ClaudeSession {
     fn apply_settings(&mut self, cx: &mut Context<Self>) {
         let s = AppSettings::get(cx);
         let now = ClaudeSettings::of(s);
-        if self.seen.as_ref() == Some(&now) {
+        if self.seen.as_ref() == Some(&now) || self.opts.own_settings && self.seen.is_some() {
             return;
         }
         self.model = MODELS.iter().position(|m| m.1 == s.claude_model).unwrap_or(0);
@@ -1230,7 +1256,7 @@ impl ClaudeSession {
     fn start(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let (Some(program), Some(root)) = (self.program.clone(), self.root.clone()) else { return false };
         let settings = AppSettings::get(cx).clone();
-        match Proc::spawn(&program, &root, MODELS[self.model].1, MODES[self.mode].1, self.session.as_deref(), &settings) {
+        match Proc::spawn(&program, &root, MODELS[self.model].1, MODES[self.mode].1, self.session.as_deref(), &settings, &self.opts) {
             Ok((mut proc, mut rx)) => {
                 // The mods draw here as on Claude Code's desktop app (see `surface`).
                 proc.send(surface::attach());
@@ -2522,6 +2548,64 @@ impl Render for ClaudeSession {
             h_flex().flex_1().min_h_0().child(self.render_conversation(window, cx)).child(self.render_stats(window, cx)).into_any_element()
         };
         v_flex().size_full().when(self.opts.chrome, |d| d.child(header(t, subtitle, actions, cx))).child(body)
+    }
+}
+
+/// What a session is doing, for the multiplexer's bars.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SessionState {
+    Idle,
+    Working,
+    /// A permission request or a question waits for you.
+    Waiting,
+    /// Its last word is an error (`claude` stopped, budget reached…).
+    Error,
+}
+
+impl ClaudeSession {
+    pub fn state(&self) -> SessionState {
+        if self.items.iter().any(|i| matches!(i, Item::Tool { ask: Some((_, None)), .. })) {
+            SessionState::Waiting
+        } else if self.busy {
+            SessionState::Working
+        } else if matches!(self.items.last(), Some(Item::Notice(_, true))) {
+            SessionState::Error
+        } else {
+            SessionState::Idle
+        }
+    }
+
+    pub fn cost(&self) -> f64 {
+        self.stats.usage.cost
+    }
+
+    /// The subscription's windows, as the last answer gave them (they are the account's, not the session's).
+    pub fn limits(&self) -> &[(&'static str, f64, i64)] {
+        &self.limits
+    }
+
+    /// Its conversation's id, to resume it.
+    pub fn conversation(&self) -> Option<&str> {
+        self.session.as_deref()
+    }
+
+    /// A message to Claude, as if typed in its box.
+    pub fn submit(&mut self, text: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.send(text, window, cx);
+    }
+
+    /// Stops the turn (the conversation goes on at the next message).
+    pub fn interrupt(&mut self, cx: &mut Context<Self>) {
+        self.stop(cx);
+    }
+
+    /// Its model and mode (indexes of `MODELS` and `MODES`), without the open file: a
+    /// multiplexer session is not about what the editor shows.
+    pub fn configure(&mut self, model: usize, mode: usize, cx: &mut Context<Self>) {
+        (self.model, self.mode, self.with_file) = (model.min(MODELS.len() - 1), mode.min(MODES.len() - 1), false);
+        // Chosen in the multiplexer's form: no need to confirm "Tout autoriser" again.
+        self.bypass_ok |= self.mode == BYPASS;
+        cx.notify();
     }
 }
 

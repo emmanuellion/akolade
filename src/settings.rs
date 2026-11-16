@@ -79,6 +79,8 @@ pub struct AppSettings {
     pub ignored: String,
     pub reopen_last_folder: bool,
     pub last_folder: Option<PathBuf>,
+    /// The projects opened lately, the last first (the multiplexer offers them).
+    pub recent_folders: Vec<PathBuf>,
     /// Programs of the completion plugins turned off.
     pub disabled_plugins: Vec<String>,
     /// Store tools added to the activity bar (`tools::TOOLS` ids).
@@ -124,6 +126,7 @@ impl Default for AppSettings {
             ignored: "node_modules, target, dist, build".into(),
             reopen_last_folder: true,
             last_folder: None,
+            recent_folders: vec![],
             disabled_plugins: vec![],
             tools: vec!["git".into()],
             icon_pack: "couleurs".into(),

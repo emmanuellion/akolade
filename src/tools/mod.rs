@@ -11,6 +11,7 @@ pub mod env;
 pub mod forge;
 pub mod http;
 pub mod kubernetes;
+pub mod mux;
 pub mod ports;
 pub mod preview;
 pub mod stats;
@@ -58,6 +59,16 @@ pub static TOOLS: &[Tool] = &[
         icon: || Icon::empty().path("icons/claude-code.svg"),
         accent: |_| gpui::rgb(claude::ORANGE).into(),
         build: |ws, root, window, cx| cx.new(|cx| claude::ClaudeView::new(ws, root, window, cx)).into(),
+    },
+    Tool {
+        id: "mux",
+        name: "Multiplexeur",
+        meta: "sessions Claude Code en parallèle",
+        about: "Plusieurs sessions Claude Code côte à côte : sur des projets différents, chacune dans son dossier, ou sur un même projet, chacune dans son worktree, avec des baux sur les fichiers, une messagerie et une file d'intégration qui teste avant de fusionner.",
+        needs: None,
+        icon: || Icon::new(IconName::LayoutDashboard),
+        accent: |_| gpui::rgb(claude::ORANGE).into(),
+        build: |ws, _, _, cx| cx.new(|_| mux::MuxView::new(ws)).into(),
     },
     Tool {
         id: "http",

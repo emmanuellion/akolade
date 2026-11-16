@@ -101,6 +101,12 @@ fn main() {
             KeyBinding::new("shift-enter", gpui_component::input::Enter { secondary: true }, Some("ClaudeComposer > Input")),
         ]);
         cx.bind_keys((1..=9).map(|n| KeyBinding::new(&format!("secondary-{n}"), SelectTab(n), Some("Workspace"))));
+        // Each `claude` (Claude Code tab, multiplexer) and what it started stops with Akolade.
+        cx.on_app_quit(|_| {
+            tools::claude::kill_all();
+            async {}
+        })
+        .detach();
         cx.on_window_closed(|cx| {
             if cx.windows().is_empty() {
                 cx.quit();
