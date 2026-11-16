@@ -940,7 +940,8 @@ impl MuxView {
             }
         };
         button(id)
-            .small()
+            // Small in the header, full size in the empty view: as the "Par projet" view's buttons.
+            .map(|b| if id == "mux-new" { b.small() } else { b })
             .primary()
             .icon(IconName::Plus)
             .label("Nouvelle session")
