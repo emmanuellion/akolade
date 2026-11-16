@@ -25,6 +25,7 @@ use gpui_component::{
     button::ButtonVariants,
     h_flex,
     input::{Enter, IndentInline, Input, InputEvent, InputState, Paste},
+    menu::{DropdownMenu, PopupMenu, PopupMenuItem},
     spinner::Spinner,
     clipboard::Clipboard,
     text::{TextView, TextViewStyle},
@@ -51,6 +52,44 @@ pub const MODES: [(&str, &str, &str); 4] = [
     ("Tout autoriser", "bypassPermissions", "Claude agit sans rien demander : commandes et modifications passent toutes seules"),
 ];
 const BYPASS: usize = 3;
+/// What each model of `MODELS` is for, in the model menu.
+const MODEL_ABOUT: [&str; 4] = ["Celui de vos réglages Claude Code", "Le plus capable, pour les tâches complexes", "Rapide et précis, pour le travail de tous les jours", "Le plus rapide et le moins cher"];
+
+/// A choice of the model menu.
+#[derive(Clone, Copy)]
+pub enum Pick {
+    Model(usize),
+    Effort(usize),
+    Mode(usize),
+}
+
+/// The model menu, as in Claude's chat: each model with what it is for, the thinking effort,
+/// then (`mode`) the permissions; the current choices checked on the right.
+pub fn choices_menu(mut menu: PopupMenu, model: usize, effort: usize, mode: Option<usize>, pick: std::rc::Rc<dyn Fn(Pick, &mut Window, &mut gpui::App)>) -> PopupMenu {
+    // All rows one width: the checks line up on the right.
+    let two_lines = |title: &'static str, about: &'static str| move |_: &mut Window, cx: &mut gpui::App| v_flex().w(r(270.)).py(r(2.)).child(div().child(title)).child(div().text_size(r(11.5)).text_color(cx.theme().muted_foreground).child(about));
+    let one_line = |title: &'static str| move |_: &mut Window, _: &mut gpui::App| div().w(r(270.)).child(title);
+    let on = |p: Pick| {
+        let pick = pick.clone();
+        move |_: &gpui::ClickEvent, window: &mut Window, cx: &mut gpui::App| pick(p, window, cx)
+    };
+    menu = menu.min_w(px(320.)).max_h(px(620.)).scrollable(true).check_side(gpui_component::Side::Right).label("Modèle");
+    for (i, (m, about)) in MODELS.iter().zip(MODEL_ABOUT).enumerate() {
+        menu = menu.item(PopupMenuItem::element(two_lines(m.0, about)).checked(i == model).on_click(on(Pick::Model(i))));
+    }
+    menu = menu.separator().label("Effort de réflexion");
+    for (i, e) in EFFORTS.iter().enumerate() {
+        menu = menu.item(PopupMenuItem::element(one_line(e.1)).checked(i == effort).on_click(on(Pick::Effort(i))));
+    }
+    if let Some(mode) = mode {
+        menu = menu.separator().label("Autorisations");
+        for (i, m) in MODES.iter().enumerate() {
+            menu = menu.item(PopupMenuItem::element(one_line(m.0)).checked(i == mode).on_click(on(Pick::Mode(i))));
+        }
+    }
+    menu
+}
+
 /// `--effort`: (value, label); "" lets Claude Code choose.
 pub const EFFORTS: [(&str, &str); 6] = [("", "Par défaut"), ("low", "Faible"), ("medium", "Moyen"), ("high", "Élevé"), ("xhigh", "Très élevé"), ("max", "Maximum")];
 const SUGGESTIONS: [&str; 3] = ["Explique-moi l'architecture de ce projet", "Cherche des bugs dans le fichier ouvert", "Écris des tests pour le fichier ouvert"];
@@ -761,7 +800,6 @@ pub struct ClaudeSession {
     /// A batched redraw is coming (`throttle`).
     frame_due: bool,
     /// A multiplexer panel's model and mode choices, unfolded.
-    show_choices: bool,
     _frame: Task<()>,
     _tick: Task<()>,
     /// The mods' band above the box, their panes (id, title, drawing), status lines, last toast.
@@ -844,7 +882,6 @@ impl ClaudeSession {
             reveal: None,
             ticking: false,
             frame_due: false,
-            show_choices: false,
             _frame: Task::ready(()),
             _tick: Task::ready(()),
             band: None,
@@ -1846,6 +1883,16 @@ impl ClaudeSession {
         cx.notify();
     }
 
+    /// Its own thinking effort, from the next message (`claude` restarts on the same conversation).
+    fn choose_effort(&mut self, i: usize, cx: &mut Context<Self>) {
+        let value = EFFORTS[i.min(EFFORTS.len() - 1)].0.to_string();
+        if !self.busy && self.opts.effort.as_ref() != Some(&value) {
+            (self.opts.effort, self.proc) = (Some(value), None);
+            self._reader = Task::ready(());
+        }
+        cx.notify();
+    }
+
     fn in_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // One process per conversation: ours stops, the terminal's takes over.
         self.stop(cx);
@@ -2277,7 +2324,9 @@ impl ClaudeSession {
         });
         // While Claude works: stop it, or send a message it takes at its next step.
         let stop = self.busy.then(|| button("claude-stop").small().ghost().icon(Icon::new(IconName::Close)).label("Arrêter").on_click(cx.listener(|this, _, _, cx| this.stop(cx))));
-        let send = button("claude-send").primary().small().icon(IconName::ArrowUp).label(if self.busy { "Mettre en file" } else { "Envoyer" }).on_click(cx.listener(|this, _, window, cx| this.send_input(window, cx)));
+        let send_label = if self.busy { "Mettre en file" } else { "Envoyer" };
+        // A multiplexer panel: the arrow alone, as in Claude's chat (the words in its tooltip).
+        let send = button("claude-send").primary().small().icon(IconName::ArrowUp).map(|b| if self.opts.chrome { b.label(send_label) } else { b.tooltip(send_label) }).on_click(cx.listener(|this, _, window, cx| this.send_input(window, cx)));
         let queued: Vec<Div> = self
             .queued
             .iter()
@@ -2352,17 +2401,32 @@ impl ClaudeSession {
                 .children(slash)
                 .child(Input::new(&self.input).appearance(false).text_size(r(14.)))
                 .map(|d| {
-                    if !self.opts.chrome && !self.show_choices {
-                        // A multiplexer panel: the model and mode in one word, unfolded on demand; sending at the right.
-                        let summary = format!("{} · {}", MODELS[self.model].0, MODES[self.mode].0);
+                    if !self.opts.chrome {
+                        // A multiplexer panel: model, effort and permissions in one menu, opening upwards.
+                        let effort = EFFORTS.iter().position(|e| e.0 == self.opts.effort.as_deref().unwrap_or(&AppSettings::get(cx).claude_effort)).unwrap_or(0);
+                        let (model, mode) = (self.model, self.mode);
+                        let me = cx.entity().downgrade();
+                        let pick: std::rc::Rc<dyn Fn(Pick, &mut Window, &mut gpui::App)> = std::rc::Rc::new(move |p, window, cx| {
+                            let _ = me.update(cx, |this, cx| match p {
+                                Pick::Model(i) => this.choose(Some(i), None, cx),
+                                Pick::Mode(i) => this.choose_mode(i, window, cx),
+                                Pick::Effort(i) => this.choose_effort(i, cx),
+                            });
+                        });
+                        let summary = format!("{} · {}", MODELS[model].0, MODES[mode].0);
                         return d.child(
                             h_flex()
                                 .gap(r(8.))
-                                // A narrow panel clips the summary, never the send button.
-                                .child(h_flex().flex_1().min_w_0().overflow_hidden().child(button("claude-choices").ghost().xsmall().label(summary).icon(Icon::new(IconName::ChevronDown).xsmall()).tooltip("Changer le modèle ou le mode d'autorisation").on_click(cx.listener(|this, _, _, cx| {
-                                    this.show_choices = true;
-                                    cx.notify();
-                                }))))
+                                .child(
+                                    h_flex().flex_1().min_w_0().overflow_hidden().child(
+                                        button("claude-choices")
+                                            .ghost()
+                                            .xsmall()
+                                            .disabled(self.busy)
+                                            .child(h_flex().gap(r(4.)).child(summary).child(Icon::new(IconName::ChevronDown).xsmall()))
+                                            .dropdown_menu_with_anchor(gpui::Corner::BottomLeft, move |menu, _, _| choices_menu(menu, model, effort, Some(mode), pick.clone())),
+                                    ),
+                                )
                                 .children(stop)
                                 .child(div().flex_shrink_0().child(send)),
                         );
@@ -2378,11 +2442,7 @@ impl ClaudeSession {
                                     .child(models)
                                     .child(div().min_w_0().children(chip))
                                     .child(div().flex_1())
-                                    .when(self.opts.chrome, |d| d.child(div().min_w_0().truncate().text_size(r(11.5)).text_color(muted).child(if cfg!(target_os = "macos") { "⏎ envoyer, ⌘⏎ à la ligne" } else { "Entrée : envoyer, Ctrl+Entrée : à la ligne" })))
-                                    .when(!self.opts.chrome, |d| d.child(button("claude-choices-fold").ghost().xsmall().icon(Icon::new(IconName::ChevronUp).xsmall()).tooltip("Replier").on_click(cx.listener(|this, _, _, cx| {
-                                        this.show_choices = false;
-                                        cx.notify();
-                                    })))),
+                                    .child(div().min_w_0().truncate().text_size(r(11.5)).text_color(muted).child(if cfg!(target_os = "macos") { "⏎ envoyer, ⌘⏎ à la ligne" } else { "Entrée : envoyer, Ctrl+Entrée : à la ligne" })),
                             )
                             .child(h_flex().gap(r(8.)).child(modes).child(div().flex_1()).children(stop).child(div().flex_shrink_0().child(send))),
                     )
@@ -2749,6 +2809,12 @@ impl ClaudeSession {
     }
 
     /// Its conversation's id, to resume it.
+    /// (model, permissions, effort): indexes in `MODELS`, `MODES` and `EFFORTS`, as chosen in its menu.
+    pub fn choices(&self, cx: &gpui::App) -> (usize, usize, usize) {
+        let effort = self.opts.effort.clone().unwrap_or_else(|| AppSettings::get(cx).claude_effort.clone());
+        (self.model, self.mode, EFFORTS.iter().position(|e| e.0 == effort).unwrap_or(0))
+    }
+
     pub fn conversation(&self) -> Option<&str> {
         self.session.as_deref()
     }
