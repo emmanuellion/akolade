@@ -114,12 +114,13 @@ use protocol::*;
 
 // ---------------------------------------------------------------- formats
 
-/// 950, 12,4 k, 1,2 M
+/// 950, 12,4 k, 1,2 M, 1,3 Md
 pub fn tokens(n: u64) -> String {
     match n {
         0..1_000 => n.to_string(),
         1_000..1_000_000 => format!("{:.1} k", n as f64 / 1e3).replace('.', ","),
-        _ => format!("{:.1} M", n as f64 / 1e6).replace('.', ","),
+        1_000_000..1_000_000_000 => format!("{:.1} M", n as f64 / 1e6).replace('.', ","),
+        _ => format!("{:.1} Md", n as f64 / 1e9).replace('.', ","),
     }
 }
 
@@ -2811,6 +2812,10 @@ impl ClaudeSession {
         self.stats.usage.cost
     }
 
+    pub fn tokens_used(&self) -> u64 {
+        self.stats.usage.tokens()
+    }
+
     /// The subscription's windows, as the last answer gave them (they are the account's, not the session's).
     pub fn limits(&self) -> &[(&'static str, f64, i64)] {
         &self.limits
@@ -3042,7 +3047,7 @@ mod tests {
         assert_eq!(details("Edit", &json!({ "old_string": "a", "new_string": "b\nc" }), None), vec![('-', "a".into()), ('+', "b".into()), ('+', "c".into())]);
         assert_eq!(edited_file("Write", &json!({ "file_path": "/p/x" })), Some(PathBuf::from("/p/x")));
         assert_eq!(edited_file("Read", &json!({ "file_path": "/p/x" })), None);
-        assert_eq!((tokens(950), tokens(12_400), tokens(1_250_000)), ("950".into(), "12,4 k".into(), "1,2 M".into()));
+        assert_eq!((tokens(950), tokens(12_400), tokens(1_250_000), tokens(1_324_200_000)), ("950".into(), "12,4 k".into(), "1,2 M".into(), "1,3 Md".into()));
         assert_eq!((usd(0.), usd(0.0044), usd(0.153), usd(12.4)), ("0 $".into(), "0,0044 $".into(), "0,153 $".into(), "12,40 $".into()));
     }
 }

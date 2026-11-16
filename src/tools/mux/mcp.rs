@@ -273,6 +273,7 @@ mod tests {
             perm: 0,
             effort: 0,
             budget: None,
+            flat: false,
         }
     }
 

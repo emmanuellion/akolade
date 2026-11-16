@@ -40,6 +40,9 @@ pub struct SessionInfo {
     pub effort: usize,
     #[serde(default)]
     pub budget: Option<f64>,
+    /// Opened in the "À plat" view (else "Par projet"): each view has its own sessions.
+    #[serde(default)]
+    pub flat: bool,
 }
 
 /// A file a session holds: no other session of its project may write it until released or expired.
@@ -508,6 +511,7 @@ mod tests {
             perm: 0,
             effort: 0,
             budget: None,
+            flat: false,
         }
     }
 

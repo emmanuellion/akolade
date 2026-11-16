@@ -7,6 +7,7 @@ pub mod coord;
 pub mod mcp;
 pub mod project;
 pub mod queue;
+pub mod stats;
 pub mod worktree;
 
 use std::path::{Path, PathBuf};
@@ -52,6 +53,8 @@ struct Slot {
     folded: bool,
     /// Its turn was stopped by "Pause": "Reprendre" asks it to go on.
     paused: bool,
+    /// Opened in the "À plat" view: shown there only (each view has its own sessions).
+    flat: bool,
     /// What its bar last showed: the tab redraws only when that changes, not at each streamed word.
     seen: (SessionState, u64),
     _sub: Subscription,
@@ -79,6 +82,7 @@ struct Launch {
     budget: Option<f64>,
     /// A session restored after a restart: its Claude Code conversation (it comes back paused).
     conversation: Option<String>,
+    flat: bool,
 }
 
 /// The "Nouvelle session" form.
@@ -101,7 +105,8 @@ struct Form {
 pub struct MuxView {
     workspace: WeakEntity<Workspace>,
     slots: Vec<Slot>,
-    /// One section per project, or all sessions side by side.
+    /// The view shown: one section per project, or all its sessions side by side ("À plat").
+    /// Each has its own sessions; those of the other go on working meanwhile.
     by_project: bool,
     form: Option<Form>,
     _form_sub: Option<Subscription>,
@@ -115,6 +120,9 @@ pub struct MuxView {
     compose: Entity<InputState>,
     to: Recipient,
     next_id: u64,
+    /// The "Statistiques" panel: shown, and Claude Code's figures read when it opened.
+    stats: bool,
+    cc_stats: Option<stats::CcStats>,
 }
 
 /// A color per project, in the order they appear.
@@ -175,7 +183,7 @@ impl MuxView {
         })
         .detach();
         let compose = cx.new(|cx| InputState::new(window, cx).placeholder("Écrire…"));
-        Self { workspace, slots: vec![], by_project: !AppSettings::get(cx).mux_flat, form: None, _form_sub: None, starting: vec![], report: None, exchanges: false, filter: None, compose, to: Recipient::All, next_id: 1 }
+        Self { workspace, slots: vec![], by_project: !AppSettings::get(cx).mux_flat, form: None, _form_sub: None, starting: vec![], report: None, exchanges: false, filter: None, compose, to: Recipient::All, next_id: 1, stats: false, cc_stats: None }
     }
 
     /// The saved sessions as panels again, paused on their conversation; an Isolated one's
@@ -224,9 +232,15 @@ impl MuxView {
                 effort: info.effort,
                 budget: info.budget,
                 conversation: Some(info.conversation.unwrap_or_default()).filter(|c| !c.is_empty()),
+                flat: info.flat,
             };
             self.start(launch, info.cwd, worktree, window, cx);
         }
+    }
+
+    /// The sessions of the view shown (indexes in `slots`).
+    fn shown(&self) -> Vec<usize> {
+        (0..self.slots.len()).filter(|&i| self.slots[i].flat != self.by_project).collect()
     }
 
     /// The projects in order of first appearance (their colors).
@@ -371,7 +385,7 @@ impl MuxView {
         let (mode, model, perm, effort) = (form.mode, form.model, form.perm, form.effort);
         let id = format!("{}-{}", project::slug(&name), self.next_id);
         self.next_id += 1;
-        let launch = Launch { id, name, role, task, project, mode, model, perm, effort, budget, conversation: None };
+        let launch = Launch { id, name, role, task, project, mode, model, perm, effort, budget, conversation: None, flat: !self.by_project };
         self.form = None;
         if mode == WorkMode::Direct {
             return self.start(launch, folder, None, window, cx);
@@ -419,6 +433,7 @@ impl MuxView {
                 perm: l.perm,
                 effort: l.effort,
                 budget: l.budget,
+                flat: l.flat,
             })
         });
         let opts = SessionOptions {
@@ -468,7 +483,7 @@ impl MuxView {
             session.update(cx, |s, cx| s.submit(l.task, window, cx));
         }
         let project = l.project.clone();
-        self.slots.push(Slot { id: l.id, name: l.name, role: l.role, project: l.project, cwd, mode: l.mode, branch, worktree, session, folded: false, paused: restored, seen: (SessionState::Idle, 0), _sub: sub });
+        self.slots.push(Slot { id: l.id, name: l.name, role: l.role, project: l.project, cwd, mode: l.mode, branch, worktree, session, folded: false, paused: restored, flat: l.flat, seen: (SessionState::Idle, 0), _sub: sub });
         self.refresh_prompts(&project, cx);
         coord::changed();
         cx.notify();
@@ -852,6 +867,67 @@ impl MuxView {
             .into_any_element()
     }
 
+    /// The "Statistiques" panel: the multiplexer's sessions (both views), then Claude Code's
+    /// own figures, every use included (its `/stats`).
+    fn render_stats(&self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme();
+        let (muted, border, fg) = (theme.muted_foreground, theme.border, theme.foreground);
+        let orange: Hsla = gpui::rgb(0xD97757).into();
+        let tile = |value: String, name: &'static str| {
+            v_flex().flex_1().min_w_0().p(r(10.)).rounded(r(8.)).bg(fg.opacity(0.04)).child(div().text_size(r(15.)).font_weight(FontWeight::SEMIBOLD).child(value)).child(div().text_size(r(11.5)).text_color(muted).child(name))
+        };
+        let row = |name: AnyElement, value: String| h_flex().gap(r(8.)).text_size(r(12.5)).child(div().flex_1().min_w_0().truncate().child(name)).child(div().flex_shrink_0().text_color(muted).child(value));
+        let (cost, used) = self.slots.iter().map(|s| s.session.read(cx)).fold((0., 0), |(c, t), s| (c + s.cost(), t + s.tokens_used()));
+        let mut panel = v_flex()
+            .id("mux-stats-panel")
+            .w(r(320.))
+            .flex_shrink_0()
+            .h_full()
+            .overflow_y_scroll()
+            .border_l_1()
+            .border_color(border)
+            .p(r(16.))
+            .gap(r(10.))
+            .child(ui::section_title("Sessions du multiplexeur", cx))
+            .child(h_flex().gap(r(8.)).child(tile(claude::usd(cost), "Coût estimé")).child(tile(claude::tokens(used), "Tokens")))
+            .children(self.slots.iter().map(|slot| {
+                let s = slot.session.read(cx);
+                let name = h_flex().gap(r(6.)).child(div().size(r(8.)).flex_shrink_0().rounded_full().bg(self.color_of(&slot.project, cx))).child(slot.name.clone()).when(slot.flat != !self.by_project, |d| d.child(div().text_color(muted).child(if slot.flat { "· à plat" } else { "· par projet" })));
+                row(name.into_any_element(), format!("{} · {}", claude::tokens(s.tokens_used()), claude::usd(s.cost())))
+            }));
+        let Some(s) = &self.cc_stats else {
+            return panel
+                .child(ui::section_title("Claude Code", cx).mt(r(8.)))
+                .child(div().text_size(r(12.5)).text_color(muted).child("Claude Code n'a pas encore calculé ses statistiques : tapez /stats une fois dans Claude Code (le terminal), puis rouvrez ce panneau."))
+                .into_any_element();
+        };
+        let days = stats::last_days(s, 30);
+        let top = days.iter().map(|d| d.1).max().unwrap_or(0);
+        let mut models: Vec<(&String, u64)> = s.model_usage.iter().map(|(m, u)| (m, u.tokens())).collect();
+        models.sort_by_key(|m| std::cmp::Reverse(m.1));
+        panel = panel
+            .child(ui::section_title("Claude Code, tous usages", cx).mt(r(8.)))
+            .child(div().text_size(r(11.5)).text_color(muted).child(format!("Calculées par Claude Code le {} (sa commande /stats), depuis le {}.", stats::fr_date(&s.last_computed_date), stats::fr_date(&s.first_session_date))))
+            .child(h_flex().gap(r(8.)).child(tile(s.total_sessions.to_string(), "Sessions")).child(tile(s.total_messages.to_string(), "Messages")))
+            .child(h_flex().gap(r(8.)).child(tile(s.favorite_hour().map_or("—".into(), |h| format!("{h} h")), "Heure favorite")).child(tile(stats::duration(s.longest_session.duration), "Plus longue session")))
+            .child(div().text_size(r(12.5)).mt(r(4.)).child("Messages, 30 jours"))
+            .child(h_flex().flex_shrink_0().h(r(56.)).items_end().gap(r(2.)).children(days.into_iter().map(|(d, messages, tools)| {
+                let part = if top > 0 { messages as f32 / top as f32 } else { 0. };
+                div()
+                    .id(SharedString::from(format!("mux-day-{d}")))
+                    .flex_1()
+                    .h(relative(part.max(0.04)))
+                    .rounded_t(r(2.))
+                    .bg(if messages > 0 { orange } else { fg.opacity(0.08) })
+                    .tooltip(move |window, cx| Tooltip::new(format!("{} : {messages} messages · {tools} outils", stats::fr_date(&d))).build(window, cx))
+            })))
+            .child(h_flex().text_size(r(11.)).text_color(muted).child(div().flex_1().child("il y a 30 jours")).child(stats::fr_date(&s.last_computed_date)));
+        if !models.is_empty() {
+            panel = panel.child(div().text_size(r(12.5)).mt(r(4.)).child("Tokens par modèle")).children(models.into_iter().map(|(m, n)| row(div().child(stats::model_label(m)).into_any_element(), claude::tokens(n))));
+        }
+        panel.into_any_element()
+    }
+
     /// "À plat": a Claude Code session in one click, on a project of the menu, without the form.
     fn render_quick_menu(&self, id: &'static str, cx: &mut Context<Self>) -> AnyElement {
         let recent = self.recent(cx);
@@ -1063,8 +1139,12 @@ impl MuxView {
         let groups: Vec<(Option<PathBuf>, Vec<usize>)> = if self.by_project {
             let mut groups = vec![];
             let mut solo = vec![];
+            let shown = self.shown();
             for p in self.projects() {
-                let ixs: Vec<usize> = (0..self.slots.len()).filter(|&i| self.slots[i].project == p).collect();
+                let ixs: Vec<usize> = shown.iter().copied().filter(|&i| self.slots[i].project == p).collect();
+                if ixs.is_empty() {
+                    continue;
+                }
                 let busy_queue = coord::with(|c| c.projects.get(&project::key(&p)).is_some_and(|s| !s.queue.is_empty() || s.merging.is_some() || !s.outcomes.is_empty()));
                 if ixs.len() == 1 && !busy_queue {
                     solo.extend(ixs);
@@ -1077,7 +1157,7 @@ impl MuxView {
             }
             groups
         } else {
-            vec![(None, (0..self.slots.len()).collect())]
+            vec![(None, self.shown())]
         };
         // One row per chunk of up to three panels: (its group's project, its index in the group, its panels, the group's).
         let rows: Vec<Row> = groups.into_iter().flat_map(|(project, ixs)| {
@@ -1203,34 +1283,36 @@ fn coord_prompt(c: &coord::Coordinator, id: &str) -> String {
 impl Render for MuxView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = tool("mux");
-        let projects = self.projects().len();
-        let total: f64 = self.slots.iter().map(|s| s.session.read(cx).cost()).sum();
+        let shown = self.shown();
+        let projects = shown.iter().map(|&i| &self.slots[i].project).collect::<std::collections::HashSet<_>>().len();
+        let total: f64 = shown.iter().map(|&i| self.slots[i].session.read(cx).cost()).sum();
         let waiting = self.slots.iter().filter(|s| s.session.read(cx).state() == SessionState::Waiting).count();
         // The subscription's windows are the account's: the same for every session.
         let limits: Vec<(&'static str, f64, i64)> = self.slots.iter().map(|s| s.session.read(cx).limits().to_vec()).find(|l| !l.is_empty()).unwrap_or_default();
-        let subtitle = if self.slots.is_empty() {
+        let subtitle = if shown.is_empty() {
             "Plusieurs sessions Claude Code en parallèle, sur un projet ou sur plusieurs.".to_string()
         } else {
-            format!("{} · {} · {} au total", ui::plural(self.slots.len(), "session"), ui::plural(projects, "projet"), claude::usd(total))
+            format!("{} · {} · {}", ui::plural(shown.len(), "session"), ui::plural(projects, "projet"), claude::usd(total))
         };
         let theme = cx.theme();
         let (muted, yellow, fg) = (theme.muted_foreground, theme.yellow, theme.foreground);
         let by_project = self.by_project;
+        // Two views, each with its own sessions (counted): both halves the same width, whichever is on.
+        let in_flat = self.slots.iter().filter(|s| s.flat).count();
+        let segment = |id: &'static str, name: &str, n: usize, on: bool, flat: bool| {
+            button(id).small().w(r(104.)).map(|b| if on { b.primary() } else { b.ghost() }).label(if n > 0 { format!("{name} ({n})") } else { name.to_string() }).on_click(cx.listener(move |this, _, _, cx| {
+                this.by_project = !flat;
+                AppSettings::update(cx, |s| s.mux_flat = flat);
+                cx.notify();
+            }))
+        };
         let toggle = h_flex()
             .gap(r(2.))
             .p(r(2.))
             .rounded(r(8.))
             .bg(fg.opacity(0.05))
-            .child(button("mux-by-project").small().map(|b| if by_project { b.primary() } else { b.ghost() }).label("Par projet").on_click(cx.listener(|this, _, _, cx| {
-                this.by_project = true;
-                AppSettings::update(cx, |s| s.mux_flat = false);
-                cx.notify();
-            })))
-            .child(button("mux-flat").small().map(|b| if by_project { b.ghost() } else { b.primary() }).label("À plat").on_click(cx.listener(|this, _, _, cx| {
-                this.by_project = false;
-                AppSettings::update(cx, |s| s.mux_flat = true);
-                cx.notify();
-            })));
+            .child(segment("mux-by-project", "Par projet", self.slots.len() - in_flat, by_project, false))
+            .child(segment("mux-flat", "À plat", in_flat, !by_project, true));
         let mut actions: Vec<AnyElement> = vec![];
         if waiting > 0 {
             actions.push(
@@ -1259,12 +1341,26 @@ impl Render for MuxView {
                     .icon(Icon::new(IconName::Inbox))
                     .label(if unread > 0 { format!("Échanges ({unread})") } else { "Échanges".into() })
                     .on_click(cx.listener(|this, _, _, cx| {
-                        this.exchanges = !this.exchanges;
+                        (this.exchanges, this.stats) = (!this.exchanges, false);
                         cx.notify();
                     }))
                     .into_any_element(),
             );
         }
+        actions.push(
+            button("mux-stats")
+                .small()
+                .map(|b| if self.stats { b.primary() } else { b.ghost() })
+                .icon(Icon::new(IconName::ChartPie))
+                .label("Statistiques")
+                .on_click(cx.listener(|this, _, _, cx| {
+                    (this.stats, this.exchanges) = (!this.stats, false);
+                    // Read again at each opening: Claude Code may have computed them meanwhile.
+                    this.cc_stats = if this.stats { stats::CcStats::load() } else { None };
+                    cx.notify();
+                }))
+                .into_any_element(),
+        );
         actions.push(if self.by_project {
             button("mux-new").small().primary().icon(IconName::Plus).label("Nouvelle session").disabled(self.form.is_some()).on_click(cx.listener(|this, _, window, cx| this.open_form(window, cx))).into_any_element()
         } else {
@@ -1281,21 +1377,28 @@ impl Render for MuxView {
                 .child("Limites de l'abonnement, communes à toutes les sessions :")
                 .children(limits.iter().map(|&(name, part, _)| div().text_color(fg).child(format!("{name} {:.0} %", part * 100.))))
         });
-        let body: AnyElement = if self.slots.is_empty() && self.form.is_none() {
-            ui::empty_state(Icon::new(IconName::LayoutDashboard), (t.accent)(cx.theme()), "Aucune session", "Lancez plusieurs sessions Claude Code côte à côte : sur des projets différents, chacune dans son dossier, ou sur un même projet, chacune dans son worktree.", cx)
+        let side: Option<AnyElement> = if self.stats {
+            Some(self.render_stats(cx))
+        } else if self.exchanges && !self.slots.is_empty() {
+            Some(self.render_exchanges(cx))
+        } else {
+            None
+        };
+        let body: AnyElement = if shown.is_empty() && self.form.is_none() {
+            let empty = ui::empty_state(Icon::new(IconName::LayoutDashboard), (t.accent)(cx.theme()), if self.slots.is_empty() { "Aucune session" } else { "Aucune session dans cette vue" }, "Lancez plusieurs sessions Claude Code côte à côte : sur des projets différents, chacune dans son dossier, ou sur un même projet, chacune dans son worktree.", cx)
                 .child(div().mt(r(8.)).child(if self.by_project {
                     button("mux-first").primary().icon(IconName::Plus).label("Nouvelle session").on_click(cx.listener(|this, _, window, cx| this.open_form(window, cx))).into_any_element()
                 } else {
                     self.render_quick_menu("mux-first", cx)
-                }))
-                .into_any_element()
+                }));
+            h_flex().size_full().child(div().flex_1().min_w_0().h_full().child(empty)).children(side).into_any_element()
         } else {
             h_flex()
                 .flex_1()
                 .min_h_0()
                 .size_full()
                 .child(div().flex_1().min_w_0().h_full().p(r(10.)).child(self.render_grid(window, cx)))
-                .when(self.exchanges, |d| d.child(self.render_exchanges(cx)))
+                .children(side)
                 .into_any_element()
         };
         v_flex()
