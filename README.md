@@ -50,6 +50,8 @@ Akolade dessine son interface sur la carte graphique avec [gpui](https://www.gpu
 **Autour du code**
 
 - Explorateur avec l'état Git de chaque fichier.
+- Ouvrir un dossier (⇧⌘O) ou un fichier (⌘O, ou le bouton à côté du nom du projet). Glisser-déposer depuis le Finder : sur l'explorateur, le fichier ou le dossier est copié dans le projet, à l'endroit visé ; ailleurs dans la fenêtre, un fichier s'ouvre et un dossier devient le projet.
+- Les onglets suivent leur fichier : modifié ailleurs (terminal, Git, Claude, un autre éditeur), il se recharge tout seul s'il n'a pas de modification en cours.
 - Recherche et remplacement dans tout le projet (⌘⇧F).
 - Panneaux Problèmes, TODO (les `TODO`, `FIXME`, `HACK` et `XXX` du projet) et Scripts (ceux de `package.json`, du `Makefile`, de Cargo et de Go).
 - Terminal intégré (⌃\`).
@@ -77,6 +79,7 @@ Si [Claude Code](https://claude.com/code) est installé sur votre ordinateur, Ak
 - **L'historique** : coût et tokens par jour, avec un graphique des 14 derniers jours.
 - **Les conversations passées** du projet, avec leur titre, leur date et leur coût. Un clic en reprend une.
 - **Le dossier de travail** est affiché en permanence, et on peut en choisir un autre que celui du projet.
+- **Deux styles** : Standard, avec ses cartes, ou Terminal, comme Claude Code dans un terminal (police à chasse fixe, `>` vos messages, `⏺` ses réponses et ses outils). Le choix se fait dans l'en-tête de l'onglet (l'œil) ou dans Paramètres › Claude.
 
 ![Claude Code dans Akolade après un tour : la réponse, les deux fichiers modifiés à garder ou annuler, et le suivi de la session à droite](docs/images/claude.png)
 
@@ -85,17 +88,24 @@ Si [Claude Code](https://claude.com/code) est installé sur votre ordinateur, Ak
 L'outil Multiplexeur fait travailler plusieurs sessions Claude Code en parallèle, dans une seule vue. Deux usages, que l'on peut mélanger :
 
 - **Plusieurs projets à la fois.** Chaque session travaille dans son propre projet, comme l'onglet Claude Code, sans rien partager avec les autres. Le multiplexeur sert de tableau de bord : leurs autorisations, leurs coûts et leur état côte à côte.
-- **Plusieurs fonctionnalités d'un même projet.** Dès qu'une deuxième session rejoint un projet, elle travaille dans son propre worktree Git, sur la branche `akolade/<session>` : rien ne touche votre copie. Les sessions d'un projet se coordonnent pour ne pas modifier les mêmes fichiers en même temps ni casser le projet.
+- **Plusieurs fonctionnalités d'un même projet.** « Ajouter une session » sur un projet propose trois façons de travailler. Les sessions d'un projet se coordonnent pour ne pas modifier les mêmes fichiers en même temps ni casser le projet.
+
+| Mode | Où travaille la session | Comment son travail rejoint le projet |
+|---|---|---|
+| **Copie** (par défaut dès la deuxième session, sans Git) | Sa propre copie du dossier du projet | Elle demande sa réintégration : ses fichiers reviennent un par un dans le projet. Un fichier modifié des deux côtés à des endroits différents est fusionné ligne à ligne ; aux mêmes endroits, un Claude tranche seul, à partir des explications des deux côtés |
+| **Directe** | Le dossier du projet, comme vous | Ses modifications y sont déjà |
+| **Isolée** (dépôt Git) | Son worktree, sur la branche `akolade/<session>` | Sa branche passe par la file d'intégration testée |
 
 Ce que le multiplexeur apporte :
 
-- **Une grille de sessions redimensionnable**, groupée par projet ou à plat. Chaque panneau a la conversation complète de Claude Code (cartes, autorisations, zone de saisie) et une barre : nom, projet, rôle, mode Directe ou Isolée avec sa branche, état (inactive, en cours, attend votre accord, bloquée par un bail, erreur), coût. Pause, reprise, repli et fermeture se font par session.
+- **Des sessions disposées comme vous voulez** : en grille, en colonnes, en lignes ou en onglets, groupées par projet ou à plat (deux vues, chacune ses sessions). On réordonne les panneaux en glissant leur barre. Chaque panneau a la conversation complète de Claude Code (cartes, autorisations, zone de saisie), en style Standard ou Terminal, pour toutes ou discussion par discussion, et une barre : nom, projet, rôle, mode Directe, Copie ou Isolée, état (inactive, en cours, attend votre accord, bloquée par un bail, erreur), coût. Pause, reprise, repli et fermeture se font par session.
 - **Les sessions qui attendent votre accord** sont surlignées et comptées en haut de la vue : aucune ne reste bloquée sans que vous le voyiez.
 - **Les baux de fichiers.** Une session qui modifie un fichier le réserve. Si une autre session du même projet veut l'écrire, Akolade refuse aussitôt, en donnant le nom du détenteur et son intention ; elle réessaie une fois le fichier libéré. Les baux d'un projet n'affectent jamais un autre projet, et vous pouvez en libérer un de force.
 - **Une messagerie.** Les sessions s'écrivent entre elles, même d'un projet à l'autre (une API et son client), par un serveur MCP intégré à Akolade. Le panneau « Échanges » montre le fil des messages et des événements, et vous permet d'écrire à une session, à un projet ou à toutes.
 - **Une file d'intégration par projet.** Une session qui a fini demande la fusion de sa branche. Akolade la fusionne dans `akolade/integration`, une à la fois et dans l'ordre, seulement si le build et les tests passent. Sinon, la session reçoit l'erreur ou la liste des conflits et corrige. Votre branche ne change que sur votre clic « Fusionner dans votre branche ». Rien n'est jamais poussé.
 - **Les réglages par session** : modèle, mode d'autorisation, effort et budget. Les coûts s'affichent par session, par projet et au total. Les limites de l'abonnement sont communes à toutes les sessions.
-- **Après un redémarrage**, les sessions reviennent en pause sur leur conversation, avec leurs messages et leurs baux. Les worktrees abandonnés sont nettoyés, et leur travail non commité est gardé sur leur branche.
+- **Le panneau Statistiques** : le coût et les tokens des sessions du multiplexeur, et les chiffres de Claude Code tous usages confondus (sessions, messages sur 30 jours, heure favorite, plus longue session, tokens par modèle).
+- **Après un redémarrage**, les sessions reviennent en pause sur leur conversation, avec leurs messages et leurs baux. Les worktrees abandonnés sont nettoyés, et leur travail non commité est gardé sur leur branche. Une copie fermée avec du travail non réintégré est gardée, jamais remplacée.
 
 Le mode restreint s'applique projet par projet, et un worktree hérite de l'approbation de son projet. L'architecture, les essais du CLI `claude` et deux scénarios de démonstration sont dans [docs/multiplexeur.md](docs/multiplexeur.md).
 
@@ -107,8 +117,8 @@ Chaque outil ajouté depuis le Store a son icône dans la barre de gauche.
 |---|---|
 | Git | Le dépôt : modifications, diff, commits, branches, remises, push et pull |
 | Claude Code | La conversation, les autorisations, le coût et les limites |
-| Multiplexeur | Plusieurs sessions Claude Code en parallèle, sur un projet ou sur plusieurs : baux de fichiers, messagerie, file d'intégration testée |
-| Client HTTP | GET, POST, PUT, PATCH, DELETE avec en-têtes et corps ; la réponse avec son code, sa durée et le JSON mis en forme. Les requêtes s'enregistrent dans le projet |
+| Multiplexeur | Plusieurs sessions Claude Code en parallèle, sur un projet ou sur plusieurs : copies réintégrées avec arbitrage par Claude, worktrees, baux de fichiers, messagerie, file d'intégration testée |
+| Client HTTP | GET, POST, PUT, PATCH, DELETE avec en-têtes et corps ; la réponse avec son code, sa durée et le JSON mis en forme. Les requêtes s'enregistrent dans le projet, sans leurs secrets (en-têtes, adresse et corps) |
 | Docker | Démarrer, arrêter, redémarrer ou supprimer un conteneur, lire ses logs, ouvrir un shell |
 | Kubernetes | Pods, déploiements et services par namespace ; logs, shell, mise à l'échelle, redirection de port |
 | Ports ouverts | Les programmes qui écoutent sur un port, à ouvrir dans le navigateur ou à arrêter |
@@ -145,7 +155,7 @@ Ouvrir un projet ne doit jamais exécuter son code. Or beaucoup d'outils le font
 
 Un dossier ouvert pour la première fois est donc en **mode restreint**, signalé dans la barre d'état. Dans ce mode :
 
-- ESLint, Clippy et les serveurs de langage qui exécutent la configuration du projet (Ruby, GraphQL) sont en pause.
+- ESLint, Clippy et les serveurs de langage qui exécutent le code ou la configuration du projet (Rust, Java, Kotlin, Elixir, Ruby, GraphQL) sont en pause.
 - Les programmes fournis par le projet (`node_modules/.bin/…`) ne sont jamais lancés à la place des vôtres.
 - Git se met en pause si le dépôt configure une commande (hooks, filtres, `core.fsmonitor`, `core.sshCommand`…). Un dépôt cloné normalement fonctionne sans rien demander.
 - Claude Code, les tests, les scripts, Prettier et l'audit des dépendances demandent votre accord avant de démarrer.
