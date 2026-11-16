@@ -175,7 +175,7 @@ impl MuxView {
         })
         .detach();
         let compose = cx.new(|cx| InputState::new(window, cx).placeholder("Écrire…"));
-        Self { workspace, slots: vec![], by_project: true, form: None, _form_sub: None, starting: vec![], report: None, exchanges: false, filter: None, compose, to: Recipient::All, next_id: 1 }
+        Self { workspace, slots: vec![], by_project: !AppSettings::get(cx).mux_flat, form: None, _form_sub: None, starting: vec![], report: None, exchanges: false, filter: None, compose, to: Recipient::All, next_id: 1 }
     }
 
     /// The saved sessions as panels again, paused on their conversation; an Isolated one's
@@ -853,7 +853,7 @@ impl MuxView {
     }
 
     /// "À plat": a Claude Code session in one click, on a project of the menu, without the form.
-    fn render_quick_menu(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_quick_menu(&self, id: &'static str, cx: &mut Context<Self>) -> AnyElement {
         let recent = self.recent(cx);
         let view = cx.entity().downgrade();
         type Act = fn(&mut MuxView, Option<PathBuf>, &mut Window, &mut Context<MuxView>);
@@ -863,13 +863,13 @@ impl MuxView {
                 let _ = view.update(cx, |this, cx| act(this, arg.clone(), window, cx));
             }
         };
-        button("mux-new")
+        button(id)
             .small()
             .primary()
             .icon(IconName::Plus)
             .label("Nouvelle session")
             .disabled(self.form.is_some())
-            .dropdown_menu_with_anchor(gpui::Corner::TopRight, move |mut menu, _, _| {
+            .dropdown_menu_with_anchor(if id == "mux-new" { gpui::Corner::TopRight } else { gpui::Corner::TopLeft }, move |mut menu, _, _| {
                 menu = menu.min_w(gpui::px(300.)).max_w(gpui::px(380.)).label("Lancer Claude Code dans…");
                 for p in &recent {
                     let (name, path) = (name_of(p), p.display().to_string().replacen(&crate::platform::home().display().to_string(), "~", 1));
@@ -887,8 +887,9 @@ impl MuxView {
 
     /// The form's model and thinking effort, in the menu of the panels (and Claude's chat).
     fn render_model_picker(&self, model: usize, effort: usize, cx: &mut Context<Self>) -> AnyElement {
-        let name = if model == 0 { "Modèle par défaut".to_string() } else { MODELS[model].0.to_string() };
-        let label = format!("{name} · effort {}", EFFORTS[effort].1.to_lowercase());
+        let name = MODELS[model].0;
+        let muted = cx.theme().muted_foreground;
+        let label = h_flex().gap(r(6.)).child(name).when(effort > 0, |d| d.child(div().text_color(muted).child(EFFORTS[effort].1)));
         let view = cx.entity().downgrade();
         let pick: claude::OnPick = std::rc::Rc::new(move |p, _, cx| {
             let _ = view.update(cx, |this, cx| {
@@ -904,7 +905,7 @@ impl MuxView {
         });
         // Its own width, the arrow after the words (the row would stretch it).
         h_flex()
-            .child(button("mux-model").small().outline().child(h_flex().gap(r(6.)).child(label).child(Icon::new(IconName::ChevronDown).xsmall())).dropdown_menu(move |menu, _, _| claude::choices_menu(menu, model, effort, None, pick.clone())))
+            .child(button("mux-model").small().outline().child(label).dropdown_menu(move |menu, window, cx| claude::model_menu(menu, model, effort, pick.clone(), window, cx)))
             .into_any_element()
     }
 
@@ -1222,10 +1223,12 @@ impl Render for MuxView {
             .bg(fg.opacity(0.05))
             .child(button("mux-by-project").small().map(|b| if by_project { b.primary() } else { b.ghost() }).label("Par projet").on_click(cx.listener(|this, _, _, cx| {
                 this.by_project = true;
+                AppSettings::update(cx, |s| s.mux_flat = false);
                 cx.notify();
             })))
             .child(button("mux-flat").small().map(|b| if by_project { b.ghost() } else { b.primary() }).label("À plat").on_click(cx.listener(|this, _, _, cx| {
                 this.by_project = false;
+                AppSettings::update(cx, |s| s.mux_flat = true);
                 cx.notify();
             })));
         let mut actions: Vec<AnyElement> = vec![];
@@ -1246,8 +1249,8 @@ impl Render for MuxView {
                     .into_any_element(),
             );
         }
+        actions.push(toggle.into_any_element());
         if !self.slots.is_empty() {
-            actions.push(toggle.into_any_element());
             let unread = coord::with(|c| c.messages.len() + c.notes.len());
             actions.push(
                 button("mux-exchanges")
@@ -1265,7 +1268,7 @@ impl Render for MuxView {
         actions.push(if self.by_project {
             button("mux-new").small().primary().icon(IconName::Plus).label("Nouvelle session").disabled(self.form.is_some()).on_click(cx.listener(|this, _, window, cx| this.open_form(window, cx))).into_any_element()
         } else {
-            self.render_quick_menu(cx)
+            self.render_quick_menu("mux-new", cx)
         });
         let limits_line = (!limits.is_empty()).then(|| {
             h_flex()
@@ -1280,7 +1283,11 @@ impl Render for MuxView {
         });
         let body: AnyElement = if self.slots.is_empty() && self.form.is_none() {
             ui::empty_state(Icon::new(IconName::LayoutDashboard), (t.accent)(cx.theme()), "Aucune session", "Lancez plusieurs sessions Claude Code côte à côte : sur des projets différents, chacune dans son dossier, ou sur un même projet, chacune dans son worktree.", cx)
-                .child(button("mux-first").primary().mt(r(8.)).icon(IconName::Plus).label("Nouvelle session").on_click(cx.listener(|this, _, window, cx| this.open_form(window, cx))))
+                .child(div().mt(r(8.)).child(if self.by_project {
+                    button("mux-first").primary().icon(IconName::Plus).label("Nouvelle session").on_click(cx.listener(|this, _, window, cx| this.open_form(window, cx))).into_any_element()
+                } else {
+                    self.render_quick_menu("mux-first", cx)
+                }))
                 .into_any_element()
         } else {
             h_flex()

@@ -1022,7 +1022,8 @@ impl PopupMenu {
         let has_left_icon = options.has_left_icon;
         let is_left_check = options.check_side.is_left() && item.is_checked();
         let right_check_icon = if options.check_side.is_right() && item.is_checked() {
-            Some(Icon::new(IconName::Check).xsmall())
+            // akolade: the check in the accent color, as in Claude's menus.
+            Some(Icon::new(IconName::Check).xsmall().text_color(cx.theme().primary))
         } else {
             None
         };
@@ -1047,6 +1048,8 @@ impl PopupMenu {
             .px(INNER_PADDING)
             .rounded(radius)
             .items_center()
+            // akolade: a pointer over what can be clicked (labels and separators set theirs back).
+            .cursor_pointer()
             .selected(selected)
             .on_hover(cx.listener(move |this, hovered, _, cx| {
                 if *hovered {
@@ -1067,6 +1070,7 @@ impl PopupMenu {
                 .mx_neg_1()
                 .h(px(1.))
                 .bg(cx.theme().border)
+                .cursor_default()
                 .disabled(true),
             PopupMenuItem::Label(label) => this.disabled(true).cursor_default().child(
                 h_flex()
@@ -1184,8 +1188,17 @@ impl PopupMenu {
                                 .gap_2()
                                 .items_center()
                                 .justify_between()
-                                .child(label.clone())
-                                .child(IconName::ChevronRight),
+                                // akolade: "label\tvalue" shows the submenu's current value, muted, before its arrow.
+                                .map(|this| match label.split_once('\t') {
+                                    Some((name, value)) => this.child(name.to_string()).child(
+                                        h_flex()
+                                            .gap_1()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(value.to_string())
+                                            .child(IconName::ChevronRight),
+                                    ),
+                                    None => this.child(label.clone()).child(IconName::ChevronRight),
+                                }),
                         ),
                 )
                 .when(selected, |this| {

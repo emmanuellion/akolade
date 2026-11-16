@@ -97,6 +97,8 @@ pub struct AppSettings {
     pub claude_with_file: bool,
     /// The files a turn changed are kept at once (still listed, and undoable from a message).
     pub claude_auto_keep: bool,
+    /// The multiplexer shows its sessions side by side, not grouped by project.
+    pub mux_flat: bool,
     /// Dollars a session may spend, 0: no limit.
     pub claude_budget: f64,
     /// Added to Claude's own instructions.
@@ -136,6 +138,7 @@ impl Default for AppSettings {
             claude_mode: "manual".into(),
             claude_with_file: true,
             claude_auto_keep: false,
+            mux_flat: false,
             claude_budget: 0.,
             claude_instructions: String::new(),
             http_timeout: 60.,

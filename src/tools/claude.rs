@@ -53,7 +53,7 @@ pub const MODES: [(&str, &str, &str); 4] = [
 ];
 const BYPASS: usize = 3;
 /// What each model of `MODELS` is for, in the model menu.
-const MODEL_ABOUT: [&str; 4] = ["Celui de vos réglages Claude Code", "Le plus capable, pour les tâches complexes", "Rapide et précis, pour le travail de tous les jours", "Le plus rapide et le moins cher"];
+const MODEL_ABOUT: [&str; 4] = ["Celui de vos réglages Claude Code", "Le plus capable, pour les tâches complexes", "Pour le travail de tous les jours", "Le plus rapide et le moins cher"];
 
 /// A choice of the model menu.
 #[derive(Clone, Copy)]
@@ -66,29 +66,37 @@ pub enum Pick {
 /// What a choice of the model menu does.
 pub type OnPick = std::rc::Rc<dyn Fn(Pick, &mut Window, &mut gpui::App)>;
 
-/// The model menu, as in Claude's chat: each model with what it is for, the thinking effort,
-/// then (`mode`) the permissions; the current choices checked on the right.
-pub fn choices_menu(mut menu: PopupMenu, model: usize, effort: usize, mode: Option<usize>, pick: OnPick) -> PopupMenu {
-    // All rows one width: the checks line up on the right.
-    let two_lines = |title: &'static str, about: &'static str| move |_: &mut Window, cx: &mut gpui::App| v_flex().w(r(270.)).py(r(2.)).child(div().child(title)).child(div().text_size(r(11.5)).text_color(cx.theme().muted_foreground).child(about));
-    let one_line = |title: &'static str| move |_: &mut Window, _: &mut gpui::App| div().w(r(270.)).child(title);
+/// The model menu, as in Claude's chat: each model with what it is for, the current one
+/// checked; the thinking effort in a submenu, its value shown.
+pub fn model_menu(mut menu: PopupMenu, model: usize, effort: usize, pick: OnPick, window: &mut Window, cx: &mut Context<PopupMenu>) -> PopupMenu {
     let on = |p: Pick| {
         let pick = pick.clone();
         move |_: &gpui::ClickEvent, window: &mut Window, cx: &mut gpui::App| pick(p, window, cx)
     };
-    menu = menu.min_w(px(320.)).max_h(px(620.)).scrollable(true).check_side(gpui_component::Side::Right).label("Modèle");
+    menu = menu.min_w(px(300.)).check_side(gpui_component::Side::Right);
     for (i, (m, about)) in MODELS.iter().zip(MODEL_ABOUT).enumerate() {
-        menu = menu.item(PopupMenuItem::element(two_lines(m.0, about)).checked(i == model).on_click(on(Pick::Model(i))));
+        // All rows one width: the checks line up on the right.
+        let row = move |_: &mut Window, cx: &mut gpui::App| v_flex().w(r(250.)).py(r(4.)).child(div().child(m.0)).child(div().text_size(r(12.)).text_color(cx.theme().muted_foreground).child(about));
+        menu = menu.item(PopupMenuItem::element(row).checked(i == model).on_click(on(Pick::Model(i))));
     }
-    menu = menu.separator().label("Effort de réflexion");
-    for (i, e) in EFFORTS.iter().enumerate() {
-        menu = menu.item(PopupMenuItem::element(one_line(e.1)).checked(i == effort).on_click(on(Pick::Effort(i))));
-    }
-    if let Some(mode) = mode {
-        menu = menu.separator().label("Autorisations");
-        for (i, m) in MODES.iter().enumerate() {
-            menu = menu.item(PopupMenuItem::element(one_line(m.0)).checked(i == mode).on_click(on(Pick::Mode(i))));
+    let efforts: Vec<_> = (0..EFFORTS.len()).map(|i| on(Pick::Effort(i))).collect();
+    menu.separator().submenu(format!("Effort\t{}", EFFORTS[effort].1), window, cx, move |mut sub, _, _| {
+        sub = sub.min_w(px(170.)).check_side(gpui_component::Side::Right);
+        for (i, e) in EFFORTS.iter().enumerate() {
+            let click = efforts[i].clone();
+            sub = sub.item(PopupMenuItem::new(e.1).checked(i == effort).on_click(click));
         }
+        sub
+    })
+}
+
+/// The permissions menu: each mode with what it lets Claude do, the current one checked.
+pub fn mode_menu(mut menu: PopupMenu, mode: usize, pick: OnPick) -> PopupMenu {
+    menu = menu.min_w(px(320.)).check_side(gpui_component::Side::Right);
+    for (i, m) in MODES.iter().enumerate() {
+        let pick = pick.clone();
+        let row = move |_: &mut Window, cx: &mut gpui::App| v_flex().w(r(270.)).py(r(4.)).child(div().child(m.0)).child(div().text_size(r(12.)).text_color(cx.theme().muted_foreground).child(m.2));
+        menu = menu.item(PopupMenuItem::element(row).checked(i == mode).on_click(move |_, window, cx| pick(Pick::Mode(i), window, cx)));
     }
     menu
 }
@@ -2416,20 +2424,17 @@ impl ClaudeSession {
                                 Pick::Effort(i) => this.choose_effort(i, cx),
                             });
                         });
-                        let summary = format!("{} · {}", MODELS[model].0, MODES[mode].0);
+                        // As in Claude's chat: the model, its effort muted; then the permissions, each its menu.
+                        let muted = cx.theme().muted_foreground;
+                        let danger = if mode == BYPASS { cx.theme().red } else { muted };
+                        let model_label = h_flex().gap(r(6.)).child(MODELS[model].0).when(effort > 0, |d| d.child(div().text_color(muted).child(EFFORTS[effort].1)));
+                        let pick_mode = pick.clone();
                         return d.child(
                             h_flex()
-                                .gap(r(8.))
-                                .child(
-                                    h_flex().flex_1().min_w_0().overflow_hidden().child(
-                                        button("claude-choices")
-                                            .ghost()
-                                            .xsmall()
-                                            .disabled(self.busy)
-                                            .child(h_flex().gap(r(4.)).child(summary).child(Icon::new(IconName::ChevronDown).xsmall()))
-                                            .dropdown_menu_with_anchor(gpui::Corner::BottomLeft, move |menu, _, _| choices_menu(menu, model, effort, Some(mode), pick.clone())),
-                                    ),
-                                )
+                                .gap(r(2.))
+                                .child(button("claude-model").ghost().xsmall().disabled(self.busy).child(model_label).dropdown_menu_with_anchor(gpui::Corner::BottomLeft, move |menu, window, cx| model_menu(menu, model, effort, pick.clone(), window, cx)))
+                                .child(button("claude-mode").ghost().xsmall().disabled(self.busy).child(div().text_color(danger).child(MODES[mode].0)).dropdown_menu_with_anchor(gpui::Corner::BottomLeft, move |menu, _, _| mode_menu(menu, mode, pick_mode.clone())))
+                                .child(div().flex_1())
                                 .children(stop)
                                 .child(div().flex_shrink_0().child(send)),
                         );
