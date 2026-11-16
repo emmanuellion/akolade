@@ -890,7 +890,7 @@ impl MuxView {
         let name = if model == 0 { "Modèle par défaut".to_string() } else { MODELS[model].0.to_string() };
         let label = format!("{name} · effort {}", EFFORTS[effort].1.to_lowercase());
         let view = cx.entity().downgrade();
-        let pick: std::rc::Rc<dyn Fn(claude::Pick, &mut Window, &mut App)> = std::rc::Rc::new(move |p, _, cx| {
+        let pick: claude::OnPick = std::rc::Rc::new(move |p, _, cx| {
             let _ = view.update(cx, |this, cx| {
                 if let Some(f) = &mut this.form {
                     match p {

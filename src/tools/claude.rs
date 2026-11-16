@@ -63,9 +63,12 @@ pub enum Pick {
     Mode(usize),
 }
 
+/// What a choice of the model menu does.
+pub type OnPick = std::rc::Rc<dyn Fn(Pick, &mut Window, &mut gpui::App)>;
+
 /// The model menu, as in Claude's chat: each model with what it is for, the thinking effort,
 /// then (`mode`) the permissions; the current choices checked on the right.
-pub fn choices_menu(mut menu: PopupMenu, model: usize, effort: usize, mode: Option<usize>, pick: std::rc::Rc<dyn Fn(Pick, &mut Window, &mut gpui::App)>) -> PopupMenu {
+pub fn choices_menu(mut menu: PopupMenu, model: usize, effort: usize, mode: Option<usize>, pick: OnPick) -> PopupMenu {
     // All rows one width: the checks line up on the right.
     let two_lines = |title: &'static str, about: &'static str| move |_: &mut Window, cx: &mut gpui::App| v_flex().w(r(270.)).py(r(2.)).child(div().child(title)).child(div().text_size(r(11.5)).text_color(cx.theme().muted_foreground).child(about));
     let one_line = |title: &'static str| move |_: &mut Window, _: &mut gpui::App| div().w(r(270.)).child(title);
@@ -2406,7 +2409,7 @@ impl ClaudeSession {
                         let effort = EFFORTS.iter().position(|e| e.0 == self.opts.effort.as_deref().unwrap_or(&AppSettings::get(cx).claude_effort)).unwrap_or(0);
                         let (model, mode) = (self.model, self.mode);
                         let me = cx.entity().downgrade();
-                        let pick: std::rc::Rc<dyn Fn(Pick, &mut Window, &mut gpui::App)> = std::rc::Rc::new(move |p, window, cx| {
+                        let pick: OnPick = std::rc::Rc::new(move |p, window, cx| {
                             let _ = me.update(cx, |this, cx| match p {
                                 Pick::Model(i) => this.choose(Some(i), None, cx),
                                 Pick::Mode(i) => this.choose_mode(i, window, cx),
