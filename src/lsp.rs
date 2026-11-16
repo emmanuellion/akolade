@@ -477,9 +477,10 @@ impl Servers {
         if self.crashed.borrow().get(&key).is_some_and(|t| t.elapsed() < RESTART_DELAY) {
             return None; // our own completion meanwhile
         }
-        // These run the project's own code (ruby-lsp its Gemfile, graphql-lsp a JS
-        // config): only in a trusted folder.
-        if matches!(server.program, "ruby-lsp" | "graphql-lsp") && !crate::trust::is_trusted(root) {
+        // These run the project's own code (ruby-lsp its Gemfile, graphql-lsp a JS config,
+        // rust-analyzer build.rs and proc macros, jdtls and kotlin's Gradle files, elixir-ls
+        // mix.exs): only in a trusted folder.
+        if matches!(server.program, "ruby-lsp" | "graphql-lsp" | "rust-analyzer" | "jdtls" | "kotlin-language-server" | "elixir-ls") && !crate::trust::is_trusted(root) {
             return None;
         }
         let program = self.find(server)?;

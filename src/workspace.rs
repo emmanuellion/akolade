@@ -11,7 +11,7 @@ use std::{
 };
 
 use gpui::{
-    Action, Animation, AnimationExt, AnyElement, AnyView, App, ClickEvent, ClipboardItem, Div, MouseButton, AppContext, Context, DragMoveEvent, Pixels, ElementId, Entity, EntityId, EntityInputHandler, FocusHandle, FontWeight, InteractiveElement, IntoElement,
+    Action, Animation, AnimationExt, AnyElement, ExternalPaths, AnyView, App, ClickEvent, ClipboardItem, Div, MouseButton, AppContext, Context, DragMoveEvent, Pixels, ElementId, Entity, EntityId, EntityInputHandler, FocusHandle, FontWeight, InteractiveElement, IntoElement,
     ParentElement, PathPromptOptions, Render, SharedString, StatefulInteractiveElement, Styled,
     Hsla, PromptLevel, ScrollHandle, ease_out_quint, linear_color_stop, linear_gradient, Rems, Rgba, Subscription, Task, Window, actions, div, relative, rems, uniform_list, prelude::FluentBuilder, px, rgb,
 };
@@ -287,6 +287,8 @@ enum Discard {
     Folder,
     /// Saving over a file that changed on disk.
     Overwrite(EntityId),
+    /// Another project while a terminal runs a program (it would stop).
+    Terminals,
 }
 
 /// Losing work takes the same action twice in a row: the first call arms
@@ -307,8 +309,13 @@ fn confirm(armed: &mut Option<Discard>, target: Discard) -> bool {
 /// permissions (a script stays executable).
 pub fn write_file(path: &Path, text: &str) -> std::io::Result<()> {
     let target = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()); // a new file: as given
-    let name = target.file_name().unwrap_or_default().to_string_lossy();
-    let tmp = target.with_file_name(format!(".{name}.akolade-tmp"));
+    // The rename would replace a read-only file all the same.
+    if fs::metadata(&target).is_ok_and(|m| m.permissions().readonly()) {
+        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "fichier en lecture seule"));
+    }
+    // Short (a long file name plus a suffix passed the 255-byte limit) and unique (two writes at once in one folder).
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let tmp = target.with_file_name(format!(".akolade-{}-{}.tmp", std::process::id(), NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
     if let Err(e) = fs::write(&tmp, text) {
         let _ = fs::remove_file(&tmp);
         // A folder we cannot add a file to, but a file we may write: in place, as before.
@@ -565,10 +572,18 @@ impl Workspace {
         });
         // Files created, deleted or renamed elsewhere (terminal, git…) show up on their own:
         // the project's open folders are read again off the UI thread.
-        let _explorer_poll = cx.spawn(async move |this, cx| {
+        // Open tabs follow their file changed elsewhere too (unmodified ones: `reload_from_disk`).
+        let _explorer_poll = cx.spawn_in(window, async move |this, cx| {
             loop {
                 cx.background_executor().timer(Duration::from_secs(2)).await;
-                let Ok(task) = this.update(cx, |this, cx| this.window_active.then(|| this.refresh_explorer(cx))) else { break };
+                let Ok(task) = this.update_in(cx, |this, window, cx| {
+                    this.window_active.then(|| {
+                        this.reload_from_disk(window, cx);
+                        this.refresh_explorer(cx)
+                    })
+                }) else {
+                    break;
+                };
                 if let Some(task) = task {
                     task.await;
                 }
@@ -577,6 +592,7 @@ impl Workspace {
         let _activation = cx.observe_window_activation(window, |this, window, cx| {
             this.window_active = window.is_window_active();
             if this.window_active {
+                this.reload_from_disk(window, cx);
                 this.refresh_git(cx).detach();
                 this.refresh_explorer(cx).detach();
             }
@@ -645,12 +661,21 @@ impl Workspace {
     }
 
     /// The window may close: nothing unsaved, or the user insisted.
+    fn terminal_busy(&self) -> bool {
+        self.terminals.iter().any(Terminal::busy)
+    }
+
     pub fn confirm_window_close(&mut self) -> bool {
         !self.buffers.iter().any(|b| b.dirty) || confirm(&mut self.discard, Discard::Window)
     }
 
     pub fn set_root(&mut self, root: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
         let changed = root != self.root;
+        // The terminals restart in the new folder: a program running there (a server, vim) would stop.
+        // (Closing the folder asks in `close_folder`.)
+        if changed && root.is_some() && self.terminal_busy() && !confirm(&mut self.discard, Discard::Terminals) {
+            return window.push_notification("Un programme tourne dans le terminal : changer de projet l'arrêtera. Refaites la même action pour changer quand même.", cx);
+        }
         if changed {
             self.explorer.clear();
             // The old project's plugins would only use memory.
@@ -1042,9 +1067,18 @@ impl Workspace {
     pub fn replace_in_files(&mut self, rels: Vec<PathBuf>, needle: &str, replacement: &str, case: bool, window: &mut Window, cx: &mut Context<Self>) {
         let Some(root) = self.root.clone() else { return };
         let (mut count, mut changed, mut on_disk) = (0, 0, vec![]);
+        // A file reached twice (through a linked folder) is replaced once, in its tab if open:
+        // twice, "user" → "user_id" would give "user_id_id".
+        let real = |p: &Path| fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        let tabs: Vec<(PathBuf, Entity<InputState>)> = self.buffers.iter().filter_map(|b| Some((real(b.path.as_ref()?), b.editor()?.clone()))).collect();
+        let mut seen = HashSet::new();
         for rel in rels {
             let path = root.join(&rel);
-            match self.buffers.iter().find(|b| b.path.as_ref() == Some(&path)).and_then(Buffer::editor).cloned() {
+            let at = real(&path);
+            if !seen.insert(at.clone()) {
+                continue;
+            }
+            match tabs.iter().find(|(p, _)| *p == at).map(|(_, e)| e.clone()) {
                 Some(editor) => {
                     let src = editor.read(cx).value().to_string();
                     let (text, n) = search::replace_all(&src, needle, replacement, case);
@@ -1515,7 +1549,7 @@ impl Workspace {
 
     /// The status bar's "Mode restreint": what it pauses, and the way out.
     pub fn trust_folder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let what = "Ce dossier est en mode restreint : son propre code ne s'exécute pas tout seul.\n\nEn pause : ESLint et Clippy (ils exécutent la configuration et les scripts du projet), Git si le dépôt configure des commandes (hooks, filtres, fsmonitor), certains serveurs de langage (Ruby, GraphQL). Claude Code, les tests, les scripts et Prettier vous demandent avant de démarrer.".to_string();
+        let what = "Ce dossier est en mode restreint : son propre code ne s'exécute pas tout seul.\n\nEn pause : ESLint et Clippy (ils exécutent la configuration et les scripts du projet), Git si le dépôt configure des commandes (hooks, filtres, fsmonitor), les serveurs de langage qui exécutent le projet (Rust, Java, Kotlin, Elixir, Ruby, GraphQL). Claude Code, les tests, les scripts et Prettier vous demandent avant de démarrer.".to_string();
         self.ask_trust(what, |_, _, _| {}, window, cx);
     }
 
@@ -1955,6 +1989,33 @@ impl Workspace {
         self.ask_text(title, initial, "Renommer", then, window, cx);
     }
 
+    /// Files or folders dropped from outside onto the explorer: copied into `to_dir` (off the UI thread).
+    fn import(&mut self, paths: Vec<PathBuf>, to_dir: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        let copied = cx.background_executor().spawn(async move { paths.iter().map(|p| files::copy_into(p, &to_dir)).collect::<Vec<_>>() });
+        cx.spawn_in(window, async move |this, cx| {
+            let done = copied.await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                for r in done {
+                    match r {
+                        Ok(to) => this.show_in_explorer(&to, cx),
+                        Err(e) => window.push_notification(Notification::error(format!("Import impossible : {e}")), cx),
+                    }
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Dropped from outside anywhere else: a folder becomes the project, files open.
+    fn open_dropped(&mut self, paths: &[PathBuf], window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(folder) = paths.iter().find(|p| p.is_dir()) {
+            self.set_root(Some(folder.clone()), window, cx);
+        }
+        for file in paths.iter().filter(|p| p.is_file()) {
+            self.open_path(file.clone(), window, cx);
+        }
+    }
+
     fn duplicate_entry(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         // Off the UI thread: a folder with node_modules is tens of thousands of files.
         let copy = cx.background_executor().spawn(async move { files::duplicate(&path) });
@@ -2308,8 +2369,11 @@ impl Workspace {
     fn close_folder(&mut self, _: &CloseFolder, window: &mut Window, cx: &mut Context<Self>) {
         let Some(root) = self.root.clone() else { return };
         let mine = |b: &Buffer| b.path.as_ref().is_some_and(|p| p.starts_with(&root));
-        if self.buffers.iter().any(|b| mine(b) && b.dirty) && !confirm(&mut self.discard, Discard::Folder) {
-            return window.push_notification("Fichiers non enregistrés : ⌘S pour les garder, fermez à nouveau le dossier pour abandonner.", cx);
+        // One warning for both (two would re-arm each other forever).
+        let (dirty, busy) = (self.buffers.iter().any(|b| mine(b) && b.dirty), self.terminal_busy());
+        if (dirty || busy) && !confirm(&mut self.discard, Discard::Folder) {
+            let what = if dirty { "Fichiers non enregistrés : ⌘S pour les garder, fermez à nouveau le dossier pour abandonner." } else { "Un programme tourne dans le terminal : fermer le dossier l'arrêtera. Fermez à nouveau pour fermer quand même." };
+            return window.push_notification(what, cx);
         }
         self.save_session();
         for b in self.buffers.iter().filter(|b| mine(b)) {
@@ -2401,6 +2465,14 @@ impl Workspace {
                         .icon(Icon::new(IconName::FolderOpen).small().text_color(theme.muted_foreground))
                         .tooltip("Ouvrir un autre dossier (⇧⌘O)")
                         .on_click(cx.listener(|this, _, window, cx| this.prompt_open(true, window, cx))),
+                )
+                .child(
+                    button("open-file-title")
+                        .ghost()
+                        .xsmall()
+                        .icon(Icon::new(IconName::File).xsmall().text_color(theme.muted_foreground))
+                        .tooltip("Ouvrir un fichier (⌘O)")
+                        .on_click(cx.listener(|this, _, window, cx| this.prompt_open(false, window, cx))),
                 )
                 .when(self.root.is_some(), |d| {
                     d.child(
@@ -2624,25 +2696,42 @@ impl Workspace {
                         .text_color(theme.muted_foreground)
                         .child("Aucun dossier ouvert.")
                         .child(button("open-folder").outline().small().w_full().label("Ouvrir un dossier")
-                            .on_click(cx.listener(|this, _, window, cx| this.prompt_open(true, window, cx)))),
+                            .on_click(cx.listener(|this, _, window, cx| this.prompt_open(true, window, cx))))
+                        .child(button("open-file").ghost().small().w_full().label("Ouvrir un fichier")
+                            .on_click(cx.listener(|this, _, window, cx| this.prompt_open(false, window, cx))))
+                        .child(div().text_size(r(12.)).child("Ou glissez un dossier ou des fichiers dans la fenêtre.")),
                 ),
                 // Only the rows on screen are built (a folder of thousands of
                 // files would otherwise be rebuilt on every keystroke).
-                Some(_) if self.explorer.visible().is_empty() => {
-                    this.child(div().px(r(14.)).pt(r(4.)).text_size(r(13.)).text_color(theme.muted_foreground).child("Dossier vide."))
+                Some(root) if self.explorer.visible().is_empty() => {
+                    let root = root.clone();
+                    this.child(
+                        div()
+                            .flex_1()
+                            .px(r(14.))
+                            .pt(r(4.))
+                            .text_size(r(13.))
+                            .text_color(theme.muted_foreground)
+                            .child("Dossier vide.")
+                            .on_drop(cx.listener(move |this, p: &ExternalPaths, window, cx| this.import(p.paths().to_vec(), root.clone(), window, cx))),
+                    )
                 }
-                Some(_) => this
-                    .child(
+                Some(root) => {
+                    let root = root.clone();
+                    this.child(
                         uniform_list("files", self.explorer.visible().len(), cx.processor(|this, range: Range<usize>, _, cx| this.render_rows(range, cx)))
                             .flex_1()
                             .min_h_0()
                             .px(r(8.))
                             .pb(r(8.))
-                            .text_size(r(13.)),
+                            .text_size(r(13.))
+                            // Below the rows: into the project's folder.
+                            .on_drop(cx.listener(move |this, p: &ExternalPaths, window, cx| this.import(p.paths().to_vec(), root.clone(), window, cx))),
                     )
                     .when(self.explorer.truncated(), |this| {
                         this.child(div().px(r(16.)).py(r(8.)).text_size(r(11.5)).text_color(theme.muted_foreground).child(format!("Un dossier dépasse {MAX_ENTRIES} éléments : seuls les premiers sont listés.")))
-                    }),
+                    })
+                }
             })
     }
 
@@ -2771,7 +2860,13 @@ impl Workspace {
                     .on_click(cx.listener(move |this, _, window, cx| this.click_entry(ix, window, cx)))
                     .on_drag(dragged, |d, _, _, cx| cx.new(|_| d.clone()))
                     .drag_over::<DraggedEntry>(move |s, _, _, _| s.bg(selected_bg))
-                    .on_drop(cx.listener(move |this, d: &DraggedEntry, window, cx| this.move_entry(d.path.clone(), drop_dir.clone(), window, cx)))
+                    .on_drop(cx.listener({
+                        let drop_dir = drop_dir.clone();
+                        move |this, d: &DraggedEntry, window, cx| this.move_entry(d.path.clone(), drop_dir.clone(), window, cx)
+                    }))
+                    // From the Finder (or another app): copied in.
+                    .drag_over::<ExternalPaths>(move |s, _, _, _| s.bg(selected_bg))
+                    .on_drop(cx.listener(move |this, p: &ExternalPaths, window, cx| this.import(p.paths().to_vec(), drop_dir.clone(), window, cx)))
                     .on_mouse_down(MouseButton::Right, cx.listener(move |this, _, _, cx| {
                         this.menu_target = Some(target.clone());
                         cx.notify();
@@ -3493,6 +3588,8 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &ZoomReset, _, cx| this.zoom(0., cx)))
             .bg(chrome)
             .text_color(theme.foreground)
+            // Dropped from outside (not on the explorer, which copies in): opened.
+            .on_drop(cx.listener(|this, p: &ExternalPaths, window, cx| this.open_dropped(p.paths(), window, cx)))
             .child(self.render_title_bar(cx))
             .child(
                 h_flex()
@@ -3666,7 +3763,14 @@ mod tests {
         assert_eq!(fs::read_to_string(dir.join("new.txt")).unwrap(), "neuf");
         assert!(write_file(&dir.join("missing/x.txt"), "x").is_err());
         let names: Vec<String> = fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
-        assert!(!names.iter().any(|n| n.contains("akolade-tmp")), "{names:?}");
+        assert!(!names.iter().any(|n| n.ends_with(".tmp")), "{names:?}");
+        // A name near the 255-byte limit saves; a read-only file is not replaced.
+        write_file(&dir.join(format!("{}.txt", "n".repeat(250))), "long").unwrap();
+        let locked = dir.join("locked.txt");
+        fs::write(&locked, "garde").unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o444)).unwrap();
+        assert_eq!(write_file(&locked, "écrasé").unwrap_err().kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(fs::read_to_string(&locked).unwrap(), "garde");
         fs::remove_dir_all(dir).unwrap();
     }
 

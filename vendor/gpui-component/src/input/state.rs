@@ -626,6 +626,9 @@ impl InputState {
         self.replace_text(value, window, cx);
         self.disabled = was_disabled;
         self.history.ignore = false;
+        // akolade: the old undo steps' ranges point into the replaced text; replayed on the new
+        // one (⌘Z after a reload from disk) they garbled it.
+        self.history.clear();
 
         // Ensure cursor to start when set text
         if self.mode.is_single_line() {

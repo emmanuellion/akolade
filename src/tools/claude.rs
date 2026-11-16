@@ -296,7 +296,7 @@ fn always_text(rules: &Value) -> Option<String> {
 }
 
 /// `claude` in PATH, or where its installer puts it (apps opened from the Dock get a short PATH).
-fn find_claude() -> Option<PathBuf> {
+pub fn find_claude() -> Option<PathBuf> {
     lsp::find_program("claude").or_else(|| {
         let home = crate::platform::home();
         [".local/bin/claude", ".claude/local/claude"].into_iter().map(|p| home.join(p)).find(|p| p.is_file())
@@ -797,6 +797,8 @@ pub struct ClaudeSession {
     log: ListState,
     /// A card other than the last two changed height (a result, a fold, an answer).
     relayout: bool,
+    /// Drawn as in the terminal (mono, prompts and bullets) rather than as cards.
+    terminal: bool,
     /// Back to the end at the next frame (a message sent, a conversation opened).
     to_bottom: bool,
     /// Pasted images and long texts, for the next message.
@@ -887,6 +889,7 @@ impl ClaudeSession {
             seen: None,
             log: ListState::new(0, ListAlignment::Bottom, px(800.)),
             relayout: false,
+            terminal: false,
             to_bottom: false,
             attachments: vec![],
             suggested: HashMap::new(),
@@ -922,6 +925,11 @@ impl ClaudeSession {
 
     /// The defaults chosen in the settings; `claude` restarts on the same conversation to apply them.
     fn apply_settings(&mut self, cx: &mut Context<Self>) {
+        // The tab's look follows its setting (a multiplexer panel's, the multiplexer's).
+        if self.opts.chrome {
+            let on = AppSettings::get(cx).claude_terminal;
+            self.set_terminal(on, cx);
+        }
         let s = AppSettings::get(cx);
         let now = ClaudeSettings::of(s);
         if self.seen.as_ref() == Some(&now) || self.opts.own_settings && self.seen.is_some() {
@@ -2249,7 +2257,87 @@ impl ClaudeSession {
             .when(more > 0, |d| d.child(div().px(r(12.)).pt(r(4.)).text_color(muted).child(format!("… {more} lignes de plus"))))
     }
 
+    /// A row as Claude Code draws it in the terminal: `>` your message, `⏺` its answers and
+    /// tools (`⎿` their result), `✻` a turn's cost. What waits for you stays a card (its buttons).
+    fn render_term_item(&self, ix: usize, item: &Item, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme();
+        let (fg, muted, green, red) = (theme.foreground, theme.muted_foreground, theme.green, theme.red);
+        let line = |mark: &'static str, color: Hsla| h_flex().items_start().gap(r(8.)).child(div().flex_shrink_0().w(r(14.)).text_color(color).child(mark));
+        let under = |text: String, color: Hsla| h_flex().gap(r(8.)).pl(r(22.)).text_color(color).child(div().flex_shrink_0().child("⎿")).child(div().flex_1().min_w_0().truncate().child(text));
+        match item {
+            Item::User(text, _, attached, before) => v_flex()
+                .group(SharedString::from(format!("user-{ix}")))
+                .child(
+                    line(">", muted)
+                        .px(r(6.))
+                        .py(r(4.))
+                        .bg(fg.opacity(0.06))
+                        .child(div().flex_1().min_w_0().child(if text.is_empty() { attached.join(", ") } else { text.clone() })),
+                )
+                .when(!attached.is_empty() && !text.is_empty(), |d| d.child(under(format!("joint : {}", attached.join(", ")), muted)))
+                .when(before.is_some() && !self.busy, |d| {
+                    d.child(div().invisible().group_hover(SharedString::from(format!("user-{ix}")), |s| s.visible()).child(
+                        button(SharedString::from(format!("rewind-{ix}"))).ghost().xsmall().label("↶ Revenir avant ce message").on_click(cx.listener(move |this, _, window, cx| this.rewind(ix, window, cx))),
+                    ))
+                })
+                .into_any_element(),
+            Item::Text(text) => {
+                let shown = match self.reveal {
+                    Some((i, n)) if i == ix => text[..n.min(text.len())].to_string(),
+                    _ => text.clone(),
+                };
+                line("⏺", fg).child(div().flex_1().min_w_0().child(markdown(("claude-md", ix), shown, window, cx))).into_any_element()
+            }
+            // Waiting for you (a permission, a question, a plan): the card and its buttons.
+            Item::Tool { ask: Some((_, None)), .. } => self.render_tool(ix, item, window, cx).into_any_element(),
+            Item::Tool { name, input, result, ask, .. } => {
+                let root = self.root.clone().unwrap_or_default();
+                let refused = matches!(ask, Some((_, Some(false))));
+                let color = match result {
+                    _ if refused => red,
+                    Some((_, true)) => red,
+                    Some(_) => green,
+                    None => muted,
+                };
+                let open = self.toggled.contains(&ix);
+                // Its result's first line, as Claude Code shows it; the rest a click away.
+                let first = match result {
+                    _ if refused => Some("Refusé".to_string()),
+                    Some((out, _)) => {
+                        let n = out.lines().count();
+                        out.lines().find(|l| !l.trim().is_empty()).map(|l| if n > 1 { format!("{} (+{} lignes)", l.trim(), n - 1) } else { l.trim().to_string() })
+                    }
+                    None => None,
+                };
+                v_flex()
+                    .child(
+                        line("⏺", color)
+                            .id(SharedString::from(format!("tool-{ix}")))
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if !this.toggled.remove(&ix) {
+                                    this.toggled.insert(ix);
+                                }
+                                this.relayout = true;
+                                cx.notify();
+                            }))
+                            // `Read(src/main.rs)`, as Claude Code writes it.
+                            .child(h_flex().flex_1().min_w_0().child(div().flex_shrink_0().font_weight(FontWeight::SEMIBOLD).child(name.clone())).child(div().min_w_0().truncate().text_color(muted).child(format!("({})", summary(name, input, &root))))),
+                    )
+                    .children(first.map(|t| under(t, if refused { red } else { muted })))
+                    .when(open, |d| d.child(div().pl(r(22.)).child(self.render_lines(details(name, input, result.as_ref().map(|r| r.0.as_str())), cx))))
+                    .into_any_element()
+            }
+            Item::Turn { secs: s, usage } => line("✻", muted).text_color(muted).child(format!("{} · {} tokens · {}", secs(*s), tokens(usage.tokens()), usd(usage.cost))).into_any_element(),
+            Item::Notice(text, error) => under(text.clone(), if *error { red } else { muted }).pl(r(0.)).into_any_element(),
+            Item::Changes { files, .. } => self.render_changes(ix, files, cx).into_any_element(),
+        }
+    }
+
     fn render_item(&self, ix: usize, item: &Item, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        if self.terminal {
+            return self.render_term_item(ix, item, window, cx);
+        }
         let theme = cx.theme();
         let (muted, primary, red) = (theme.muted_foreground, theme.primary, theme.red);
         match item {
@@ -2396,11 +2484,11 @@ impl ClaudeSession {
                 .max_w(r(800.))
                 .p(r(10.))
                 .gap(r(8.))
-                .rounded(r(14.))
+                .rounded(r(if self.terminal { 4. } else { 14. }))
                 .border_1()
                 .border_color(border)
                 .bg(bg)
-                .shadow_sm()
+                .when(!self.terminal, |d| d.shadow_sm())
                 .key_context("ClaudeComposer")
                 .capture_action(cx.listener(Self::paste))
                 .capture_action(cx.listener(Self::enter))
@@ -2411,7 +2499,10 @@ impl ClaudeSession {
                 .children(queued)
                 .when(!self.attachments.is_empty(), |d| d.child(self.render_attachments(cx)))
                 .children(slash)
-                .child(Input::new(&self.input).appearance(false).text_size(r(14.)))
+                .map(|d| {
+                    let input = Input::new(&self.input).appearance(false).text_size(r(if self.terminal { 13. } else { 14. }));
+                    if self.terminal { d.child(h_flex().gap(r(4.)).child(div().text_color(muted).child(">")).child(div().flex_1().min_w_0().child(input))) } else { d.child(input) }
+                })
                 .map(|d| {
                     if !self.opts.chrome {
                         // A multiplexer panel: model, effort and permissions in one menu, opening upwards.
@@ -2524,7 +2615,7 @@ impl ClaudeSession {
         // An answer starts after your message: Claude's name above it, as the speaker.
         let starts_answer = ix > 0 && matches!(self.items.get(ix - 1), Some(Item::User(..))) && matches!(self.items.get(ix), Some(Item::Text(_) | Item::Tool { .. }));
         let content: AnyElement = match self.items.get(ix) {
-            Some(item) if starts_answer => {
+            Some(item) if starts_answer && !self.terminal => {
                 let muted = cx.theme().muted_foreground;
                 v_flex()
                     .gap(r(8.))
@@ -2542,13 +2633,18 @@ impl ClaudeSession {
                     .gap(r(8.))
                     .text_size(r(13.))
                     .text_color(muted)
-                    .when(shown && self.opts.chrome, |d| d.child(Spinner::new().small().color(rgb(ORANGE).into())))
-                    .when(shown && !self.opts.chrome, |d| d.child(Icon::new(IconName::Ellipsis).small().text_color(rgb(ORANGE))))
+                    .when(shown && self.terminal, |d| d.child(div().text_color(rgb(ORANGE)).child("✻")))
+                    .when(shown && !self.terminal && self.opts.chrome, |d| d.child(Spinner::new().small().color(rgb(ORANGE).into())))
+                    .when(shown && !self.terminal && !self.opts.chrome, |d| d.child(Icon::new(IconName::Ellipsis).small().text_color(rgb(ORANGE))))
                     .when(shown, |d| d.child(if working { "Claude travaille…" } else { "Claude réfléchit…" }))
                     .into_any_element()
             }
         };
         // Block layout, centered by margins: cheaper to lay out than a flex row.
+        if self.terminal {
+            // Full width, tight: lines, not cards.
+            return div().block().px(r(12.)).pt(r(if ix == 0 { 12. } else { 0. })).pb(r(8.)).child(content).into_any_element();
+        }
         div().block().px(r(if self.opts.chrome { 24. } else { 14. })).pt(r(if ix == 0 { 20. } else { 0. })).pb(r(14.)).child(div().block().w_full().max_w(r(800.)).mx_auto().child(content)).into_any_element()
     }
 
@@ -2574,7 +2670,14 @@ impl ClaudeSession {
         } else {
             list(self.log.clone(), cx.processor(|this, ix: usize, window, cx| this.render_row(ix, window, cx))).size_full().into_any_element()
         };
-        v_flex().flex_1().min_w_0().h_full().child(div().flex_1().min_h_0().child(log)).child(self.render_composer(window, cx))
+        let mono = cx.theme().mono_font_family.clone();
+        v_flex()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .when(self.terminal, |d| d.font_family(mono).text_size(r(13.)))
+            .child(div().flex_1().min_h_0().child(log))
+            .child(self.render_composer(window, cx))
     }
 
     fn render_stats(&self, window: &mut Window, cx: &mut Context<Self>) -> gpui::Stateful<Div> {
@@ -2738,6 +2841,19 @@ impl Render for ClaudeSession {
         };
         let actions = vec![
             button("claude-past").map(|b| if self.show_past { b.primary() } else { b.ghost() }).small().icon(Icon::empty().path("icons/history.svg")).label("Conversations").tooltip("Reprendre une conversation passée").disabled(self.program.is_none() || self.root.is_none()).on_click(cx.listener(|this, _, _, cx| this.toggle_past(cx))).into_any_element(),
+            button("claude-look")
+                .ghost()
+                .small()
+                .icon(IconName::Eye)
+                .tooltip("Style de la discussion")
+                .dropdown_menu_with_anchor(gpui::Corner::TopRight, {
+                    let on = self.terminal;
+                    move |menu, _, _| {
+                        let pick = |t: bool| move |_: &gpui::ClickEvent, _: &mut Window, cx: &mut gpui::App| AppSettings::update(cx, |s| s.claude_terminal = t);
+                        menu.label("Style de la discussion").item(PopupMenuItem::new("Standard").checked(!on).on_click(pick(false))).item(PopupMenuItem::new("Terminal").checked(on).on_click(pick(true)))
+                    }
+                })
+                .into_any_element(),
             button("claude-terminal").ghost().small().icon(IconName::SquareTerminal).tooltip("Continuer cette conversation dans le terminal").disabled(self.program.is_none()).on_click(cx.listener(|this, _, window, cx| this.in_terminal(window, cx))).into_any_element(),
             button("claude-new").outline().small().icon(IconName::Plus).label("Nouvelle session").disabled(self.items.is_empty()).on_click(cx.listener(|this, _, _, cx| this.reset(cx))).into_any_element(),
         ];
@@ -2783,6 +2899,14 @@ impl ClaudeSession {
             SessionState::Error
         } else {
             SessionState::Idle
+        }
+    }
+
+    /// Its look: as in the terminal, or cards (every row is measured again).
+    pub fn set_terminal(&mut self, on: bool, cx: &mut Context<Self>) {
+        if self.terminal != on {
+            (self.terminal, self.relayout) = (on, true);
+            cx.notify();
         }
     }
 

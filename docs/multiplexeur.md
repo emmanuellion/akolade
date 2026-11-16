@@ -86,13 +86,22 @@ Ce que le multiplexeur ajoute à une session, par `SessionOptions` :
 
 `project_of(dir)` renvoie la racine du dépôt (`git::toplevel`), sinon le dossier lui-même. Deux sessions dans `X/api` et `X/web` d'un même dépôt appartiennent au même projet.
 
-Mode par défaut :
-- **Directe** si la session est seule sur son projet ;
-- **Isolée** dès qu'une session existe déjà sur le projet.
+Trois modes de travail :
+- **Directe** : dans le dossier du projet. Le mode par défaut d'une session seule sur son projet.
+- **Copie** (`copy.rs`) : dans sa propre copie du dossier, sans Git, avec à côté son point de départ (les fichiers tels qu'ils étaient). Le mode par défaut d'une session qui rejoint d'autres sessions sur un projet : aucune de ses commandes ne touche le dossier des autres.
+- **Isolée** : dans un worktree Git (2.3). Elle seule demande un dépôt ; sans dépôt, l'interface le dit et propose `git init`.
 
-Règles :
-- une seule session Directe active par projet ;
-- un projet sans Git n'accepte qu'une session. L'interface l'explique et propose `git init`.
+Le menu « + » d'une session ou de son projet, et « Mode de travail » du formulaire, choisissent le mode.
+
+**Réintégrer une copie.** Quand la session a fini, elle appelle `request_merge` avec un résumé qui dit, fichier par fichier, ce qu'elle a changé et pourquoi. La demande passe par la file du projet (une réintégration à la fois). Pour chaque fichier, comparé au point de départ :
+- changé dans la copie seulement : repris tel quel (créé, modifié ou supprimé) ;
+- changé des deux côtés à des endroits différents : fusionné ligne à ligne (`git merge-file`, si Git est installé) ;
+- changé des deux côtés aux mêmes endroits : un Claude Code tranche (`claude -p`, sans outils, sans session enregistrée, cinq minutes au plus). Il reçoit les trois versions, le résumé de la session et, pour le côté du projet, les résumés des copies réintégrées depuis qui ont touché ce fichier. Il écrit le fichier final et dit en une phrase ce qu'il a gardé ;
+- binaire, ou arbitre en échec : la version du projet est gardée, celle de la copie y reste, et le rapport le dit.
+
+Le rapport va à la session (un message d'Akolade) et dans la file du projet. Ensuite la copie et son point de départ repartent du dossier tel qu'il est devenu. Les dossiers de dépendances et de build (`node_modules`, `target`, `dist`…) ne sont ni comparés ni réintégrés : la copie garde les siens. Fermer une session copie supprime sa copie, sauf si elle a du travail non réintégré : elle reste alors, et une note dit où.
+
+Les sessions Directes d'un même dossier partagent l'état de Git : leurs consignes leur interdisent de changer de branche, `git stash`, `git reset` et `git checkout` de fichiers, et de commiter d'autres fichiers que les leurs. Leur travail n'entre pas dans la file d'intégration (pas de branche) : il est déjà dans votre dossier.
 
 ### 2.3 Worktrees
 
@@ -113,7 +122,7 @@ Côté `can_use_tool`, pour Edit, Write, MultiEdit et NotebookEdit :
 - fichier détenu par une autre session : refus automatique avec le nom du détenteur et son intention ;
 - session seule sur son projet : aucun bail visible, mais les baux restent tenus pour le jour où une autre session arrive.
 
-**Limite : Bash.** Une commande (`sed -i`, `npm run format`…) écrit sans `can_use_tool` de type Edit. Les baux ne la voient pas. C'est le worktree qui protège : chaque session Isolée écrit dans sa propre copie, et seule la file d'intégration réunit le travail.
+**Limite : Bash.** Une commande (`sed -i`, `npm run format`…) écrit sans `can_use_tool` de type Edit. Les baux ne la voient pas. C'est le worktree qui protège : chaque session Isolée écrit dans sa propre copie, et seule la file d'intégration réunit le travail. Des sessions Directes dans un même dossier n'ont pas cette protection : une commande de l'une peut réécrire un fichier qu'une autre a réservé. Pour des formateurs ou des scripts qui touchent tout le projet, préférez des sessions Isolées.
 
 **Messagerie.** Un message a un expéditeur, un destinataire (session, projet ou tout le monde), une date et un état lu ou non lu. Il passe entre projets. Il est aussi poussé à la session destinataire comme message utilisateur (« [Message de api · projet X] … »), possible pendant un tour d'après 1.2. Une session en pause le trouve dans `read_inbox` à sa reprise.
 
@@ -151,6 +160,13 @@ Chaque `claude` est lancé dans son propre groupe (`platform::own_group`) et tu�
 
 Mesures : voir 5.
 
+### 2.10 Affichage
+
+- **Vues.** « Par projet » et « À plat » ont chacune leurs sessions (`SessionInfo::flat`, celle d'où la session a été lancée).
+- **Disposition** (menu Affichage, `mux_layout`) : Grille (trois par rangée), Colonnes (toutes côte à côte), Lignes (une par rangée), Onglets (une à la fois, les autres en onglets).
+- **Ordre.** La barre d'une session (ou son onglet) se glisse sur une autre : elle prend sa place. L'ordre est celui du coordinateur, gardé au redémarrage.
+- **Style des discussions** : Standard (cartes) ou Terminal (police à chasse fixe, `>` vos messages, `⏺` ses réponses et ses outils, `⎿` leur résultat). Le menu Affichage règle toutes les discussions (`mux_terminal`) ; le menu ⋯ d'une session lui en donne un à elle (`SessionInfo::terminal`). Ce qui attend votre accord reste une carte, avec ses boutons.
+
 ## 3. Étapes de livraison
 
 1. Extraction de `ClaudeSession`, sans changement de l'onglet Claude Code.
@@ -181,7 +197,7 @@ La première fois qu'une session part dans un projet, Akolade demande d'approuve
 
 ### Scénario A : plusieurs fonctionnalités d'un même projet
 
-Trois sessions sur `/tmp/akolade-demo/calc`. La première est proposée en Directe : choisissez **Isolée**. Les deux suivantes le sont d'office. Toutes les trois sont en « Tout autoriser », pour que la démo avance seule : Akolade rejoue ce mode et vérifie toujours les baux.
+Trois sessions sur `/tmp/akolade-demo/calc`. Choisissez **Isolée** pour chacune (« Mode de travail », ou « + › Dans son propre worktree »). Toutes les trois sont en « Tout autoriser », pour que la démo avance seule : Akolade rejoue ce mode et vérifie toujours les baux.
 
 | Nom | Tâche |
 |---|---|

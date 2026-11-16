@@ -213,7 +213,9 @@ pub fn parse_cargo(out: &str, root: &Path) -> Vec<TestCase> {
         tests.push(test);
     }
     for (name, msg) in messages {
-        let Some(test) = tests.iter_mut().find(|t| t.id == name) else { continue };
+        // Two binaries may both have `tests::it_works`: the message goes to a failed one not told yet.
+        let Some(ix) = tests.iter().position(|t| t.id == name && t.status == Status::Failed && t.message.is_empty()).or_else(|| tests.iter().position(|t| t.id == name)) else { continue };
+        let test = &mut tests[ix];
         test.message = msg.trim().to_string();
         if test.file.is_none()
             && let Some((file, line)) = panic_location(&msg)
@@ -784,6 +786,10 @@ test src/lib.rs - add (line 3) ... ok
         assert_eq!((t[2].group.as_str(), t[2].status), ("", Status::Ignored));
         assert_eq!((t[3].id.as_str(), t[3].name.as_str()), ("math::tests::boom", "boom"));
         assert_eq!((t[4].group.as_str(), t[4].name.as_str(), t[4].line), ("src/lib.rs", "add (line 3)", 2));
+        // The same name in two test binaries, the second one failing: its message is its own.
+        let twice = "running 1 test\ntest tests::it_works ... ok\n\nrunning 1 test\ntest tests::it_works ... FAILED\n\nfailures:\n\n---- tests::it_works stdout ----\nboom\n\nfailures:\n    tests::it_works\n";
+        let t = parse_cargo(twice, &root());
+        assert_eq!((t[0].message.as_str(), t[1].message.as_str()), ("", "boom"));
     }
 
     #[test]

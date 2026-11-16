@@ -28,7 +28,7 @@ fn tools() -> Value {
         { "name": "claim_files", "description": "Réserve des fichiers de ton projet avant de les modifier : aucune autre session du projet ne pourra les écrire tant que tu ne les libères pas.", "inputSchema": { "type": "object", "properties": { "paths": paths, "intent": { "type": "string", "description": "Ce que tu vas y faire" } }, "required": ["paths", "intent"] } },
         { "name": "release_files", "description": "Libère des fichiers réservés (tous si la liste est vide).", "inputSchema": { "type": "object", "properties": { "paths": paths } } },
         { "name": "list_claims", "description": "Les fichiers réservés dans ton projet, par qui et pourquoi.", "inputSchema": { "type": "object", "properties": {} } },
-        { "name": "request_merge", "description": "Ton travail est fini : ta branche entre dans la file d'intégration du projet. Akolade la fusionne dans akolade/integration si le build et les tests passent, sinon il te renvoie l'erreur. Commite d'abord ton travail.", "inputSchema": { "type": "object", "properties": { "summary": { "type": "string", "description": "Ce que la branche apporte" } }, "required": ["summary"] } },
+        { "name": "request_merge", "description": "Ton travail est fini, il rejoint le projet. Session Isolée : commite d'abord ; ta branche entre dans la file d'intégration et n'est fusionnée dans akolade/integration que si le build et les tests passent. Session Copie : ta copie est réintégrée dans le dossier du projet ; si un fichier y a aussi changé, un Claude tranche à partir de ton résumé.", "inputSchema": { "type": "object", "properties": { "summary": { "type": "string", "description": "Ce que tu as changé et pourquoi, fichier par fichier : c'est ce qui permet de trancher un conflit" } }, "required": ["summary"] } },
     ])
 }
 
@@ -274,6 +274,7 @@ mod tests {
             effort: 0,
             budget: None,
             flat: false,
+            terminal: None,
         }
     }
 

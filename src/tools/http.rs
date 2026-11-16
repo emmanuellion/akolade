@@ -72,7 +72,8 @@ pub fn send(method: &str, url: &str, headers: &str, body: &str, timeout: u64) ->
 fn run_curl(dir: &Path, method: &str, url: &str, headers: &str, body: &str, timeout: u64) -> Result<Response, String> {
     let (head, out) = (dir.join("head"), dir.join("body"));
     let mut cmd = crate::platform::command("curl");
-    cmd.args(["-sS", "--max-time", &timeout.to_string(), "-X", method, "-D"]).arg(&head).arg("-o").arg(&out).args(["-w", "%{http_code} %{time_total} %{size_download}"]);
+    // At most 100 MB on the disk (2 MB of it shown): a GET on a huge file must not fill it.
+    cmd.args(["-sS", "--max-filesize", "104857600", "--max-time", &timeout.to_string(), "-X", method, "-D"]).arg(&head).arg("-o").arg(&out).args(["-w", "%{http_code} %{time_total} %{size_download}"]);
     for line in headers.lines().map(str::trim).filter(|l| l.contains(':')) {
         cmd.arg("-H").arg(line);
     }
@@ -179,6 +180,41 @@ pub fn url_without_secret(url: &str) -> String {
     format!("{base}?{}", params.join("&"))
 }
 
+/// `{"password":"x"}` → `{"password":""}`, `password=x&a=1` → `password=&a=1`, for the same
+/// reason. Anything else, as typed.
+pub fn body_without_secret(body: &str) -> String {
+    fn blank(v: &mut serde_json::Value) -> bool {
+        use serde_json::Value;
+        match v {
+            Value::Object(m) => m.iter_mut().fold(false, |any, (k, v)| match v {
+                Value::String(s) if is_secret(k) && !s.is_empty() => {
+                    s.clear();
+                    true
+                }
+                Value::Number(_) if is_secret(k) => {
+                    *v = Value::String(String::new());
+                    true
+                }
+                v => blank(v) || any,
+            }),
+            Value::Array(a) => a.iter_mut().map(blank).fold(false, |any, b| any | b), // every item, not the first only
+            _ => false,
+        }
+    }
+    let trimmed = body.trim();
+    if let Ok(mut v) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        // Rewritten only when something was hidden: the body stays as typed otherwise.
+        return if blank(&mut v) { serde_json::to_string_pretty(&v).unwrap_or_default() } else { body.to_string() };
+    }
+    if !trimmed.contains('\n') && trimmed.contains('=') && !trimmed.starts_with(['{', '[']) {
+        return trimmed.split('&').map(|p| match p.split_once('=') {
+            Some((k, v)) if !v.is_empty() && is_secret(k) => format!("{k}="),
+            _ => p.to_string(),
+        }).collect::<Vec<_>>().join("&");
+    }
+    body.to_string()
+}
+
 pub struct HttpView {
     workspace: WeakEntity<Workspace>,
     /// The project whose requests are listed.
@@ -246,7 +282,7 @@ impl HttpView {
         Saved {
             name: if name.is_empty() { default_name(&method, &url) } else { name },
             headers: self.headers.read(cx).value().lines().map(str::trim).filter(|l| !l.is_empty()).map(without_secret).collect(),
-            body: self.body.read(cx).value().to_string(),
+            body: body_without_secret(self.body.read(cx).value().as_str()),
             method,
             url,
         }
@@ -306,7 +342,7 @@ impl HttpView {
         if draft.url.is_empty() {
             return window.push_notification("Entrez une adresse avant d'enregistrer.", cx);
         }
-        let hidden = self.headers.read(cx).value().lines().map(str::trim).any(|l| without_secret(l) != l) || draft.url != self.url.read(cx).value().trim();
+        let hidden = self.headers.read(cx).value().lines().map(str::trim).any(|l| without_secret(l) != l) || draft.url != self.url.read(cx).value().trim() || draft.body != self.body.read(cx).value().as_str();
         let before = (self.saved.clone(), self.current);
         match self.current.filter(|i| *i < self.saved.len()) {
             Some(i) => self.saved[i] = draft.clone(),
@@ -317,7 +353,7 @@ impl HttpView {
         }
         if self.write(window, cx) {
             self.name.update(cx, |i, cx| i.set_value(draft.name, window, cx));
-            let note = if hidden { " (les secrets des en-têtes et de l'adresse ne sont pas enregistrés)" } else { "" };
+            let note = if hidden {  " (les secrets des en-têtes, de l'adresse et du corps ne sont pas enregistrés)" } else { "" };
             window.push_notification(Notification::success(format!("Requête enregistrée dans .akolade/http.json{note}")), cx);
         } else {
             (self.saved, self.current) = before;
@@ -640,6 +676,10 @@ mod tests {
         assert_eq!(url_without_secret("https://user:pass@api.x.com/v1?api_key=k&page=2&token=t#top"), "https://api.x.com/v1?api_key=&page=2&token=#top");
         assert_eq!(url_without_secret("http://localhost:3000/u?email=a@b.c"), "http://localhost:3000/u?email=a@b.c");
         assert_eq!(url_without_secret("https://x/a"), "https://x/a");
+        assert_eq!(body_without_secret(r#"{"user":"a","password":"hunter2","auth":{"api_key":"k"},"pin_token":1234}"#), "{\n  \"user\": \"a\",\n  \"password\": \"\",\n  \"auth\": {\n    \"api_key\": \"\"\n  },\n  \"pin_token\": \"\"\n}");
+        assert_eq!(body_without_secret("{\"page\": 2}"), "{\"page\": 2}", "nothing secret: as typed");
+        assert_eq!(body_without_secret("user=a&password=x&n=1"), "user=a&password=&n=1");
+        assert_eq!(body_without_secret("du texte libre"), "du texte libre");
     }
 
     #[test]

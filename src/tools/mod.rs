@@ -232,7 +232,7 @@ pub fn header(t: &Tool, subtitle: impl Into<String>, actions: Vec<AnyElement>, c
             v_flex()
                 .flex_1()
                 .min_w_0()
-                .child(div().text_size(r(16.)).font_weight(FontWeight::SEMIBOLD).child(t.name))
+                .child(div().whitespace_nowrap().text_size(r(16.)).font_weight(FontWeight::SEMIBOLD).child(t.name))
                 .child(div().truncate().text_size(r(12.5)).text_color(theme.muted_foreground).child(subtitle.into())),
         )
         .children(actions)

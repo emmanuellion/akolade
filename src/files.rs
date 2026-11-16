@@ -72,6 +72,18 @@ pub fn move_into(from: &Path, to_dir: &Path) -> Result<PathBuf, String> {
     Ok(to)
 }
 
+/// A copy of `from` (a file or a whole folder, dropped from outside) into the folder `to_dir`;
+/// a name already taken there gets " copie". Err if it would go into itself.
+pub fn copy_into(from: &Path, to_dir: &Path) -> Result<PathBuf, String> {
+    if to_dir.starts_with(from) {
+        return Err("Un dossier ne peut pas aller dans lui-même.".into());
+    }
+    let to = to_dir.join(from.file_name().ok_or("Ce chemin n'a pas de nom.")?);
+    let to = if fs::symlink_metadata(&to).is_ok() { copy_name(&to) } else { to };
+    copy_all(from, &to).map_err(|e| e.to_string())?;
+    Ok(to)
+}
+
 /// "rapport.pdf" → "rapport copie.pdf", then "rapport copie 2.pdf"…
 fn copy_name(path: &Path) -> PathBuf {
     let dir = path.parent().unwrap_or(Path::new("/"));
@@ -126,6 +138,22 @@ pub fn trash(path: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dropped_files_and_folders_are_copied_in() {
+        let (src, proj) = (dir("drop-src"), dir("drop-proj"));
+        fs::write(src.join("notes.txt"), "a").unwrap();
+        fs::create_dir_all(src.join("photos/2026")).unwrap();
+        fs::write(src.join("photos/2026/plage.jpg"), "jpg").unwrap();
+        assert_eq!(copy_into(&src.join("notes.txt"), &proj).unwrap(), proj.join("notes.txt"));
+        assert_eq!(copy_into(&src.join("notes.txt"), &proj).unwrap(), proj.join("notes copie.txt"), "a taken name");
+        copy_into(&src.join("photos"), &proj).unwrap();
+        assert_eq!(fs::read_to_string(proj.join("photos/2026/plage.jpg")).unwrap(), "jpg");
+        assert!(src.join("notes.txt").exists(), "copied, not moved");
+        assert!(copy_into(&proj, &proj.join("photos")).is_err(), "not into itself");
+        let _ = fs::remove_dir_all(&src);
+        let _ = fs::remove_dir_all(&proj);
+    }
 
     fn dir(name: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("akolade-files-{}-{name}", std::process::id()));

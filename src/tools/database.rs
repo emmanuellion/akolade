@@ -264,6 +264,8 @@ pub struct DatabaseView {
     table: Option<String>,
     result: Option<Result<Outcome, String>>,
     busy: bool,
+    /// The query whose result is awaited: an older one's (another table or base clicked since) is dropped.
+    run: u64,
     _subs: Vec<Subscription>,
 }
 
@@ -283,7 +285,7 @@ impl DatabaseView {
                 }
             }),
         ];
-        let mut view = Self { workspace, root, files: vec![], scanning: false, path, editor, db: None, tables: None, table: None, result: None, busy: false, _subs };
+        let mut view = Self { workspace, root, files: vec![], scanning: false, path, editor, db: None, tables: None, table: None, result: None, busy: false, run: 0, _subs };
         view.scan(cx);
         view
     }
@@ -336,6 +338,7 @@ impl DatabaseView {
 
     fn open_db(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         (self.db, self.tables, self.table, self.result) = (Some(path.clone()), None, None, None);
+        (self.run, self.busy) = (self.run + 1, false);
         cx.notify();
         self.load_tables(cx);
     }
@@ -396,11 +399,23 @@ impl DatabaseView {
     fn start(&mut self, work: impl FnOnce(&Path) -> Result<Outcome, String> + Send + 'static, cx: &mut Context<Self>) {
         let Some(db) = self.db.clone() else { return };
         self.busy = true;
+        self.run += 1;
+        let run = self.run;
         cx.notify();
-        let task = cx.background_executor().spawn(async move { work(&db) });
+        let task = cx.background_executor().spawn({
+            let db = db.clone();
+            async move { work(&db) }
+        });
         cx.spawn(async move |this, cx| {
             let result = task.await;
             let _ = this.update(cx, |this, cx| {
+                if this.run != run {
+                    // Its change is made all the same: the tables' list follows.
+                    if matches!(result, Ok(Outcome::Changed(_))) && this.db.as_ref() == Some(&db) {
+                        this.load_tables(cx);
+                    }
+                    return;
+                }
                 this.busy = false;
                 if matches!(result, Ok(Outcome::Changed(_))) {
                     this.load_tables(cx);

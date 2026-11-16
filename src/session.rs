@@ -41,8 +41,9 @@ pub fn save(dir: &Path, root: &Path, mut session: Session) {
     if all.get(root) == Some(&session) {
         return;
     }
-    // Folders deleted since (temporary ones…) would only make the file grow.
-    all.retain(|r, _| r.is_dir());
+    // Folders deleted since (temporary ones…) would only make the file grow. One whose parent
+    // is gone too is kept: likely on a disk unplugged for now (/Volumes/SSD/projet).
+    all.retain(|r, _| r.is_dir() || r.parent().is_some_and(|p| !p.exists()));
     all.insert(root.to_path_buf(), session);
     let _ = fs::create_dir_all(dir);
     if let Ok(text) = serde_json::to_string_pretty(&all) {
@@ -53,6 +54,13 @@ pub fn save(dir: &Path, root: &Path, mut session: Session) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Written as is, as if saved back when the folder was there.
+    fn all_with(dir: &Path, root: &Path, s: &Session) {
+        let mut all = read_all(dir);
+        all.insert(root.to_path_buf(), s.clone());
+        fs::write(file(dir), serde_json::to_string(&all).unwrap()).unwrap();
+    }
 
     #[test]
     fn tabs_come_back_per_project_without_deleted_files() {
@@ -68,6 +76,15 @@ mod tests {
         assert_eq!(back.files, vec![a.join("main.rs"), a.join("lib.rs")], "a deleted file is not reopened");
         assert_eq!(back.active, None, "the active tab's file is gone");
         assert_eq!(load(&dir, &dir.join("unknown")), Session::default());
+        // A project on an unplugged disk keeps its tabs; a deleted folder's go.
+        let (away, deleted) = (dir.join("disque-absent/projet"), dir.join("supprimé"));
+        let tabs = Session { files: vec![away.join("x.rs")], active: None };
+        for root in [&away, &deleted] {
+            all_with(&dir, root, &tabs);
+        }
+        save(&dir, &a, Session::default());
+        let kept = read_all(&dir);
+        assert!(kept.contains_key(&away) && !kept.contains_key(&deleted));
         // Hand-broken file: kept aside, not overwritten by the next save.
         fs::write(file(&dir), "{ oops").unwrap();
         save(&dir, &b, Session::default());

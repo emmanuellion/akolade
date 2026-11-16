@@ -43,6 +43,9 @@ pub struct SessionInfo {
     /// Opened in the "À plat" view (else "Par projet"): each view has its own sessions.
     #[serde(default)]
     pub flat: bool,
+    /// Its own look (true: as in the terminal); None: the multiplexer's.
+    #[serde(default)]
+    pub terminal: Option<bool>,
 }
 
 /// A file a session holds: no other session of its project may write it until released or expired.
@@ -103,10 +106,16 @@ pub struct MergeRequest {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MergeOutcome {
     pub session: String,
+    /// Empty: a copy brought back into the project's folder.
     pub branch: String,
     pub merged: bool,
     pub report: String,
     pub at: u64,
+    /// What it said of its work, and the files it brought: why the project changed, for a later conflict.
+    #[serde(default)]
+    pub summary: String,
+    #[serde(default)]
+    pub files: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -209,7 +218,7 @@ impl Coordinator {
         self.sessions.iter().find(|s| s.id == id)
     }
 
-    fn name_of(&self, id: &str) -> String {
+    pub fn name_of(&self, id: &str) -> String {
         self.session(id).map_or_else(|| id.to_string(), |s| s.name.clone())
     }
 
@@ -413,12 +422,14 @@ impl Coordinator {
     /// `request_merge`: the session's branch joins its project's queue (once).
     pub fn request_merge(&mut self, id: &str, summary: &str, now: u64) -> Result<usize, String> {
         let me = self.session(id).cloned().ok_or("Session inconnue.")?;
-        let branch = me.branch.clone().ok_or("Cette session travaille directement dans le projet (mode Directe) : il n'y a rien à fusionner, ses modifications y sont déjà.")?;
+        // A copy: no branch, brought back into the folder (an empty branch says so).
+        let branch = me.branch.clone().or((me.mode == WorkMode::Copy).then(String::new)).ok_or("Cette session travaille directement dans le projet (mode Directe) : il n'y a rien à fusionner, ses modifications y sont déjà.")?;
         let p = self.projects.entry(super::project::key(&me.project)).or_default();
         p.queue.retain(|r| r.session != id);
         p.queue.push(MergeRequest { session: id.to_string(), branch, summary: summary.to_string(), at: now });
         let pos = p.queue.len() + p.merging.is_some() as usize;
-        self.note(Some(&me.project), format!("{} demande la fusion de sa branche : {summary}", me.name), now);
+        let what = if me.mode == WorkMode::Copy { "la réintégration de sa copie" } else { "la fusion de sa branche" };
+        self.note(Some(&me.project), format!("{} demande {what} : {summary}", me.name), now);
         Ok(pos)
     }
 
@@ -439,18 +450,24 @@ impl Coordinator {
 
     /// The merge being done ended: kept in the project's history, told to the session (an
     /// Akolade message: it reads the error and fixes its branch), noted in the panel.
-    pub fn finish_merge(&mut self, project: &Path, merged: bool, report: String, now: u64) {
+    pub fn finish_merge(&mut self, project: &Path, merged: bool, report: String, files: Vec<String>, now: u64) {
         let Some(req) = self.projects.get_mut(&super::project::key(project)).and_then(|p| p.merging.take()) else { return };
         let name = self.name_of(&req.session);
         let p = self.projects.entry(super::project::key(project)).or_default();
-        p.outcomes.push(MergeOutcome { session: req.session.clone(), branch: req.branch.clone(), merged, report: report.clone(), at: now });
+        p.outcomes.push(MergeOutcome { session: req.session.clone(), branch: req.branch.clone(), merged, report: report.clone(), at: now, summary: req.summary.clone(), files });
         if p.outcomes.len() > 20 {
             p.outcomes.remove(0);
         }
-        let verdict = if merged { "fusionnée dans akolade/integration" } else { "renvoyée (build, tests ou conflit)" };
-        self.note(Some(project), format!("Branche {} de {name} {verdict}", req.branch), now);
+        let copy = req.branch.is_empty();
+        let text = match (copy, merged) {
+            (true, true) => format!("Copie de {name} réintégrée dans le dossier du projet"),
+            (true, false) => format!("Copie de {name} non réintégrée"),
+            (false, true) => format!("Branche {} de {name} fusionnée dans akolade/integration", req.branch),
+            (false, false) => format!("Branche {} de {name} renvoyée (build, tests ou conflit)", req.branch),
+        };
+        self.note(Some(project), text, now);
         if self.session(&req.session).is_some() {
-            self.post("akolade", name, vec![req.session], &format!("File d'intégration — {report}"), now);
+            self.post("akolade", name, vec![req.session], &format!("{} — {report}", if copy { "Réintégration" } else { "File d'intégration" }), now);
         }
     }
 
@@ -512,6 +529,7 @@ mod tests {
             effort: 0,
             budget: None,
             flat: false,
+            terminal: None,
         }
     }
 
@@ -626,7 +644,7 @@ mod tests {
         let (p2, r2, _) = c.next_merge().unwrap();
         assert_eq!((p1.as_path(), r1.session.as_str(), p2.as_path(), r2.session.as_str()), (Path::new("/x"), "b", Path::new("/y"), "y"));
         assert!(c.next_merge().is_none(), "/x is busy with b");
-        c.finish_merge(Path::new("/x"), false, "tests en échec".into(), 6);
+        c.finish_merge(Path::new("/x"), false, "tests en échec".into(), vec![], 6);
         assert!(c.inbox("b")[0].text.contains("tests en échec"), "the session is told");
         assert_eq!(c.next_merge().unwrap().1.session, "a");
     }

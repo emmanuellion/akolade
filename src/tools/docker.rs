@@ -109,21 +109,28 @@ impl DockerView {
         let _poll = cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(Duration::from_secs(3)).await;
+                // Awaited: a stuck command (Docker starting, a dead network mount) must not
+                // be joined by a new one every 3 s.
                 let shown = this.update(cx, |this, cx| match std::mem::take(&mut this.rendered) {
-                    true => this.refresh(cx),
-                    false => this.stale = true,
+                    true => Some(this.refresh(cx)),
+                    false => {
+                        this.stale = true;
+                        None
+                    }
                 });
-                if shown.is_err() {
-                    break;
+                match shown {
+                    Ok(Some(load)) => load.await,
+                    Ok(None) => {}
+                    Err(_) => break,
                 }
             }
         });
         let mut view = Self { workspace, list: Ok(vec![]), loaded: false, busy: None, rendered: false, stale: false, _poll };
-        view.refresh(cx);
+        view.refresh(cx).detach();
         view
     }
 
-    fn refresh(&mut self, cx: &mut Context<Self>) {
+    fn refresh(&mut self, cx: &mut Context<Self>) -> Task<()> {
         cx.spawn(async move |this, cx| {
             let list = cx.background_executor().spawn(async { containers() }).await;
             let _ = this.update(cx, |this, cx| {
@@ -131,7 +138,6 @@ impl DockerView {
                 cx.notify();
             });
         })
-        .detach();
     }
 
     fn act(&mut self, c: &Container, action: &'static str, window: &mut Window, cx: &mut Context<Self>) {
@@ -222,7 +228,7 @@ impl Render for DockerView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.rendered = true;
         if std::mem::take(&mut self.stale) {
-            self.refresh(cx);
+            self.refresh(cx).detach();
         }
         let muted = cx.theme().muted_foreground;
         let list = self.list.clone();

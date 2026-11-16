@@ -11,6 +11,8 @@ pub enum WorkMode {
     Direct,
     /// In a git worktree of its own, on the branch `akolade/<session>`.
     Isolated,
+    /// In a copy of the project's folder (no git needed), brought back when done (see `copy`).
+    Copy,
 }
 
 impl WorkMode {
@@ -18,6 +20,7 @@ impl WorkMode {
         match self {
             WorkMode::Direct => "Directe",
             WorkMode::Isolated => "Isolée",
+            WorkMode::Copy => "Copie",
         }
     }
 }
@@ -26,30 +29,6 @@ impl WorkMode {
 /// are one project), else the folder itself.
 pub fn project_of(dir: &Path) -> PathBuf {
     crate::git::toplevel(dir).unwrap_or_else(|| dir.to_path_buf())
-}
-
-/// What a new session on `project` may do, given the modes of the sessions already there.
-#[derive(Debug, PartialEq)]
-pub enum Admission {
-    /// Allowed, with this mode chosen by default.
-    Open(WorkMode),
-    /// No git: one session only, and that one is there already.
-    NoGit,
-}
-
-/// Alone on its project: Direct (usage B). Joining others: Isolated (usage A), the
-/// only choice once a Direct one works there. Without git there is no worktree: one session.
-pub fn admission(has_git: bool, others: &[WorkMode]) -> Admission {
-    match (has_git, others.is_empty()) {
-        (_, true) => Admission::Open(WorkMode::Direct),
-        (false, false) => Admission::NoGit,
-        (true, false) => Admission::Open(WorkMode::Isolated),
-    }
-}
-
-/// A Direct session may start only if no other Direct one works on the project.
-pub fn direct_allowed(others: &[WorkMode]) -> bool {
-    !others.contains(&WorkMode::Direct)
 }
 
 /// A short, stable folder name for a project: its name and a hash of its path (two
@@ -109,16 +88,6 @@ mod tests {
         assert_eq!(project_of(&plain), plain);
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&plain);
-    }
-
-    #[test]
-    fn the_default_mode_follows_who_is_there() {
-        assert_eq!(admission(true, &[]), Admission::Open(WorkMode::Direct));
-        assert_eq!(admission(false, &[]), Admission::Open(WorkMode::Direct));
-        assert_eq!(admission(true, &[WorkMode::Direct]), Admission::Open(WorkMode::Isolated));
-        assert_eq!(admission(true, &[WorkMode::Isolated, WorkMode::Isolated]), Admission::Open(WorkMode::Isolated));
-        assert_eq!(admission(false, &[WorkMode::Direct]), Admission::NoGit);
-        assert!(direct_allowed(&[WorkMode::Isolated]) && !direct_allowed(&[WorkMode::Isolated, WorkMode::Direct]));
     }
 
     #[test]

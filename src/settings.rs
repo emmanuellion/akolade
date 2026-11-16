@@ -97,8 +97,14 @@ pub struct AppSettings {
     pub claude_with_file: bool,
     /// The files a turn changed are kept at once (still listed, and undoable from a message).
     pub claude_auto_keep: bool,
+    /// The Claude Code tab drawn as in the terminal (mono, `>` and `⏺`), not as cards.
+    pub claude_terminal: bool,
     /// The multiplexer shows its sessions side by side, not grouped by project.
     pub mux_flat: bool,
+    /// How the multiplexer lays its panels out: "" (grid), "columns", "rows" or "tabs".
+    pub mux_layout: String,
+    /// The multiplexer's conversations drawn as in the terminal (each may differ, see its menu).
+    pub mux_terminal: bool,
     /// Dollars a session may spend, 0: no limit.
     pub claude_budget: f64,
     /// Added to Claude's own instructions.
@@ -138,7 +144,10 @@ impl Default for AppSettings {
             claude_mode: "manual".into(),
             claude_with_file: true,
             claude_auto_keep: false,
+            claude_terminal: false,
             mux_flat: false,
+            mux_layout: String::new(),
+            mux_terminal: false,
             claude_budget: 0.,
             claude_instructions: String::new(),
             http_timeout: 60.,
@@ -440,6 +449,7 @@ impl Render for SettingsView {
                         SettingItem::new("Toujours garder les modifications", switch(|s| s.claude_auto_keep, |s, v| s.claude_auto_keep = v))
                             .description("Les fichiers modifiés par Claude sont gardés d'office à la fin de chaque tour. Leur liste et leur diff restent affichés, et « Revenir avant ce message » les annule toujours."),
                     )
+                    .item(SettingItem::new("Style Terminal", switch(|s| s.claude_terminal, |s, v| s.claude_terminal = v)).description("La conversation s'affiche comme Claude Code dans le terminal : police à chasse fixe, > vos messages, ⏺ ses réponses et ses outils."))
                     .item(
                         SettingItem::new("Budget maximum par session ($)", number(0., 1000., 0.5, |s| s.claude_budget, |s, v| s.claude_budget = v).default_value(d.claude_budget))
                             .description("Claude s'arrête une fois ce montant dépensé, au tarif de l'API. 0 : sans limite."),

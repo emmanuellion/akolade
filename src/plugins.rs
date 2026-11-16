@@ -9,9 +9,9 @@ use std::{
 };
 
 use gpui::{
-    AnyElement, App, AppContext, Context, Div, Entity, FontWeight, Hsla, InteractiveElement, IntoElement, ParentElement, Pixels, PromptLevel, Render,
+    Animation, AnimationExt, AnyElement, App, AppContext, Context, Div, Entity, FontWeight, Hsla, InteractiveElement, IntoElement, ParentElement, Pixels, PromptLevel, Render,
     SharedString, Stateful, StatefulInteractiveElement, Styled, Subscription, Task, WeakEntity, Window, canvas, div, prelude::FluentBuilder, px, relative,
-    rgb,
+    ease_out_quint, rgb,
 };
 use gpui_component::{
     ActiveTheme, Disableable, Icon, IconName, Sizable, WindowExt,
@@ -249,6 +249,9 @@ impl Category {
     }
 }
 
+/// A section of the store opening or shutting.
+const SECTION_SLIDE: Duration = Duration::from_millis(220);
+
 /// The store tab: tools, completion plugins, formatters and themes.
 pub struct PluginsView {
     workspace: WeakEntity<Workspace>,
@@ -256,6 +259,8 @@ pub struct PluginsView {
     search: Entity<InputState>,
     /// Sections folded (in "Tout" and "Installés").
     folded: HashSet<Category>,
+    /// The section sliding open (true) or shut, and its animation's number (a click restarts it).
+    sliding: Option<(Category, bool, u64)>,
     /// Width of the card area, measured while painting: sets the grid's columns.
     width: Rc<Cell<Pixels>>,
     found: Found,
@@ -281,7 +286,7 @@ impl PluginsView {
         let _search = cx.subscribe(&search, |_, _, _: &InputEvent, cx| cx.notify());
         // Once on the UI thread at open: the first frame shows the right states, unsorted cards never flash.
         let found = Found::lookup();
-        Self { workspace, category: Category::All, search, folded: HashSet::new(), width: Rc::default(), found, jobs: 0, _lookup: Task::ready(()), _refresh, _search }
+        Self { workspace, category: Category::All, search, folded: HashSet::new(), sliding: None, width: Rc::default(), found, jobs: 0, _lookup: Task::ready(()), _refresh, _search }
     }
 
     fn look_again(&mut self, cx: &mut Context<Self>) {
@@ -779,6 +784,11 @@ impl Render for PluginsView {
                             let n = cards.len();
                             let titled = matches!(self.category, Category::All | Category::Mine);
                             let folded = titled && self.folded.contains(&c);
+                            let slide = self.sliding.filter(|s| s.0 == c && titled);
+                            // The grid's height (cards are all one height): what the slide opens or shuts.
+                            let rows = n.div_ceil(cols as usize) as f32;
+                            let full = r(212.).to_pixels(rem) * rows + gap * (rows - 1.).max(0.);
+                            let section_gap = r(14.).to_pixels(rem);
                             // Not shrunk to the visible height: the area scrolls instead.
                             v_flex()
                                 .flex_shrink_0()
@@ -791,9 +801,23 @@ impl Render for PluginsView {
                                             .gap(r(3.))
                                             .cursor_pointer()
                                             .on_click(cx.listener(move |this, _, _, cx| {
-                                                if !this.folded.remove(&c) {
+                                                let opening = this.folded.remove(&c);
+                                                if !opening {
                                                     this.folded.insert(c);
                                                 }
+                                                let n = this.sliding.map_or(0, |s| s.2 + 1);
+                                                this.sliding = Some((c, opening, n));
+                                                // Shut once slid: its cards are drawn until then.
+                                                cx.spawn(async move |this, cx| {
+                                                    cx.background_executor().timer(SECTION_SLIDE).await;
+                                                    let _ = this.update(cx, |this, cx| {
+                                                        if this.sliding.is_some_and(|s| s.2 == n) {
+                                                            this.sliding = None;
+                                                            cx.notify();
+                                                        }
+                                                    });
+                                                })
+                                                .detach();
                                                 cx.notify();
                                             }))
                                             .child(
@@ -809,7 +833,22 @@ impl Render for PluginsView {
                                             .when(!folded, |d| d.child(div().pl(r(51.)).text_size(r(13.)).text_color(muted).child(c.about()))),
                                     )
                                 })
-                                .when(!folded, |d| d.child(div().grid().grid_cols(cols).gap(gap).children(cards)))
+                                .map(|d| {
+                                    let grid = div().grid().grid_cols(cols).gap(gap).children(cards);
+                                    match slide {
+                                        // Its height from 0 to full (or back), the gap above it too: what is below slides along.
+                                        Some((_, opening, n)) => d.child(div().overflow_hidden().child(grid).with_animation(
+                                            (SharedString::from(format!("section-slide-{}", c.label())), n as usize),
+                                            Animation::new(SECTION_SLIDE).with_easing(ease_out_quint()),
+                                            move |el, t| {
+                                                let t = if opening { t } else { 1. - t };
+                                                el.h(full * t).mt(section_gap * (t - 1.)).opacity(t)
+                                            },
+                                        )),
+                                        None if !folded => d.child(grid),
+                                        None => d,
+                                    }
+                                })
                         }))
                         .when(empty, |d| {
                             let (title, text) = if query.is_empty() { ("Rien ici pour l'instant", "Installez un plugin depuis les autres catégories.".to_string()) } else { ("Aucun résultat", format!("Rien ne correspond à « {query} ».")) };
