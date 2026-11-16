@@ -44,6 +44,23 @@ fn call(c: &mut Coordinator, me: &str, name: &str, args: &Value, now: u64) -> Va
     let arg = |k: &str| args[k].as_str().unwrap_or_default().to_string();
     let scope = if arg("scope") == "tout" { Scope::All } else { Scope::Project };
     let Some(mine) = c.session(me).cloned() else { return text_result("Session inconnue d'Akolade.".into(), true) };
+    // The arguments the schema requires: missing (or misnamed), said so, nothing done.
+    let required: &[&str] = match name {
+        "send_message" => &["to", "text"],
+        "broadcast" => &["text"],
+        "claim_files" => &["paths", "intent"],
+        "request_merge" => &["summary"],
+        _ => &[],
+    };
+    let missing: Vec<&str> = required.iter().copied().filter(|k| match &args[*k] {
+        Value::String(s) => s.trim().is_empty(),
+        Value::Array(a) => a.is_empty(),
+        _ => true,
+    }).collect();
+    if !missing.is_empty() {
+        let given: Vec<&str> = args.as_object().map(|o| o.keys().map(String::as_str).collect()).unwrap_or_default();
+        return text_result(format!("Paramètre manquant : {} (reçu : {}). Rien n'a été fait.", missing.join(", "), if given.is_empty() { "aucun".into() } else { given.join(", ") }), true);
+    }
     let project_name = |p: &std::path::Path| p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     match name {
         "list_sessions" => {
@@ -86,7 +103,7 @@ fn call(c: &mut Coordinator, me: &str, name: &str, args: &Value, now: u64) -> Va
             text_result(out.join("\n"), !refused.is_empty() && taken.is_empty())
         }
         "release_files" => {
-            let n = c.release(me, &strings(&args["paths"]));
+            let n = c.release(me, &strings(&args["paths"]), now);
             if n > 0 {
                 c.note(Some(&mine.project), format!("{} libère {}", mine.name, crate::ui::plural(n, "fichier")), now);
             }
@@ -306,6 +323,11 @@ mod tests {
         assert_eq!(tool(&mut c, "front", "release_files", json!({ "paths": [] })).0, "1 fichier libéré.");
         assert_eq!(c.check_write("back", "src/api.rs", 11), WriteCheck::Granted);
         assert!(tool(&mut c, "back", "request_merge", json!({ "summary": "écran" })).0.contains("prochaine"));
+        // Misnamed arguments (as a model may send them): refused, nothing sent.
+        let (said, error) = tool(&mut c, "front", "send_message", json!({ "to": "back", "message": "?" }));
+        assert!(error && said.contains("Paramètre manquant : text (reçu : to, message)"), "{said}");
+        assert!(tool(&mut c, "front", "claim_files", json!({ "files": ["a.rs"] })).1);
+        assert!(c.inbox("back").iter().all(|m| !m.text.is_empty()));
     }
 
     /// The whole chain with the real CLI: `claude` → `akolade mcp-coord` → this server → the coordinator.

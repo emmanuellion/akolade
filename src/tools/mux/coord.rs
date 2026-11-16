@@ -131,9 +131,47 @@ pub struct Coordinator {
     pub messages: Vec<Message>,
     pub notes: Vec<Note>,
     pub next_message: u64,
+    /// Writes refused on a held file: (project key, path, session). Told when the file is free.
+    pub waiting: Vec<(String, String, String)>,
     /// Per project key (`project::key`): its leases.
     #[serde(skip)]
     pub projects: BTreeMap<String, ProjectState>,
+}
+
+// ---------------------------------------------------------------- saved
+
+impl Coordinator {
+    /// `dir/multiplexeur.json`: sessions and messages; `dir/multiplexeur/<project>.json`: each project's leases and queue.
+    pub fn save(&self, dir: &Path) {
+        let folder = dir.join("multiplexeur");
+        let _ = std::fs::create_dir_all(&folder);
+        if let Ok(text) = serde_json::to_string(self) {
+            let _ = crate::workspace::write_file(&dir.join("multiplexeur.json"), &text);
+        }
+        for (key, state) in &self.projects {
+            let path = folder.join(format!("{key}.json"));
+            if *state == ProjectState::default() {
+                let _ = std::fs::remove_file(&path);
+            } else if let Ok(text) = serde_json::to_string(state) {
+                let _ = crate::workspace::write_file(&path, &text);
+            }
+        }
+    }
+
+    /// As saved; a merge cut short by a quit goes back to the front of its queue.
+    pub fn load(dir: &Path) -> Self {
+        let mut c: Coordinator = crate::settings::read_json(&dir.join("multiplexeur.json"));
+        for entry in std::fs::read_dir(dir.join("multiplexeur")).into_iter().flatten().flatten() {
+            let path = entry.path();
+            let Some(key) = path.file_stem().map(|k| k.to_string_lossy().into_owned()).filter(|_| path.extension().is_some_and(|e| e == "json")) else { continue };
+            let mut state: ProjectState = crate::settings::read_json(&path);
+            if let Some(cut) = state.merging.take() {
+                state.queue.insert(0, cut);
+            }
+            c.projects.insert(key, state);
+        }
+        c
+    }
 }
 
 /// `path` relative to `root`, `/`-separated, without `.` or `..` (None: outside `root`).
@@ -192,17 +230,40 @@ impl Coordinator {
         if let Some(key) = self.key_of(id)
             && let Some(p) = self.projects.get_mut(&key)
         {
+            let gone: Vec<String> = p.leases.iter().filter(|l| l.owner == id).map(|l| l.path.clone()).collect();
             p.leases.retain(|l| l.owner != id);
             p.queue.retain(|r| r.session != id);
+            self.waiting.retain(|(_, _, s)| s != id);
+            self.freed(&key, &gone, now());
         }
         self.sessions.retain(|s| s.id != id);
     }
 
     /// The project's leases still running at `now`.
     pub fn leases(&mut self, project: &Path, now: u64) -> Vec<Lease> {
-        let p = self.projects.entry(super::project::key(project)).or_default();
+        let key = super::project::key(project);
+        self.expire(&key, now);
+        self.projects.entry(key).or_default().leases.clone()
+    }
+
+    /// Leases past their time go (their files freed).
+    fn expire(&mut self, key: &str, now: u64) {
+        let p = self.projects.entry(key.to_string()).or_default();
+        let gone: Vec<String> = p.leases.iter().filter(|l| l.until <= now).map(|l| l.path.clone()).collect();
         p.leases.retain(|l| l.until > now);
-        p.leases.clone()
+        self.freed(key, &gone, now);
+    }
+
+    /// Files free again: the sessions refused on them are told (an Akolade message), to try again.
+    fn freed(&mut self, key: &str, paths: &[String], now: u64) {
+        let (told, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.waiting).into_iter().partition(|(k, p, _)| k == key && paths.contains(p));
+        self.waiting = kept;
+        for (_, path, session) in told {
+            if self.session(&session).is_some() {
+                let name = self.name_of(&session);
+                self.post("akolade", name, vec![session], &format!("{path} est libre : tu peux reprendre la modification qui avait été refusée."), now);
+            }
+        }
     }
 
     /// A write by `id` to `path` (absolute, or relative to its checkout): granted, and
@@ -211,13 +272,14 @@ impl Coordinator {
         let Some(me) = self.session(id).cloned() else { return WriteCheck::Outside };
         let Some(rel) = normalize(&me.checkout.to_string_lossy(), path) else { return WriteCheck::Outside };
         let key = super::project::key(&me.project);
-        let held = {
-            let p = self.projects.entry(key.clone()).or_default();
-            p.leases.retain(|l| l.until > now);
-            p.leases.iter().find(|l| l.path == rel && l.owner != id).cloned()
-        };
+        self.expire(&key, now);
+        let held = self.projects.entry(key.clone()).or_default().leases.iter().find(|l| l.path == rel && l.owner != id).cloned();
         if let Some(l) = held {
             let name = self.name_of(&l.owner);
+            if !self.waiting.iter().any(|(k, p, s)| *k == key && *p == rel && s == id) {
+                self.waiting.push((key.clone(), rel.clone(), id.to_string()));
+                self.note(Some(&me.project), format!("{} refusée sur {rel}, réservé par {name}", me.name), now);
+            }
             return WriteCheck::Held { owner: l.owner, name, intent: l.intent };
         }
         let p = self.projects.entry(key).or_default();
@@ -251,13 +313,15 @@ impl Coordinator {
     }
 
     /// `release_files`: its own leases on `paths` (all of them if empty) go.
-    pub fn release(&mut self, id: &str, paths: &[String]) -> usize {
+    pub fn release(&mut self, id: &str, paths: &[String], now: u64) -> usize {
         let Some(me) = self.session(id).cloned() else { return 0 };
         let rels: Vec<String> = paths.iter().filter_map(|p| normalize(&me.checkout.to_string_lossy(), p)).collect();
-        let Some(p) = self.projects.get_mut(&super::project::key(&me.project)) else { return 0 };
-        let before = p.leases.len();
-        p.leases.retain(|l| !(l.owner == id && (rels.is_empty() || rels.contains(&l.path))));
-        before - p.leases.len()
+        let key = super::project::key(&me.project);
+        let Some(p) = self.projects.get_mut(&key) else { return 0 };
+        let gone: Vec<String> = p.leases.iter().filter(|l| l.owner == id && (rels.is_empty() || rels.contains(&l.path))).map(|l| l.path.clone()).collect();
+        p.leases.retain(|l| !gone.contains(&l.path));
+        self.freed(&key, &gone, now);
+        gone.len()
     }
 
     /// A line in the "Échanges" panel.
@@ -388,10 +452,12 @@ impl Coordinator {
     }
 
     /// From the multiplexer: a lease ends whoever holds it.
-    pub fn force_release(&mut self, project: &Path, path: &str) {
-        if let Some(p) = self.projects.get_mut(&super::project::key(project)) {
+    pub fn force_release(&mut self, project: &Path, path: &str, now: u64) {
+        let key = super::project::key(project);
+        if let Some(p) = self.projects.get_mut(&key) {
             p.leases.retain(|l| l.path != path);
         }
+        self.freed(&key, &[path.to_string()], now);
     }
 }
 
@@ -405,8 +471,10 @@ pub fn with<R>(f: impl FnOnce(&mut Coordinator) -> R) -> R {
     f(&mut HUB.lock().unwrap_or_else(|e| e.into_inner()))
 }
 
-/// Something changed: the multiplexer redraws (from any thread).
+/// Something changed: saved, and the multiplexer redraws (from any thread).
 pub fn changed() {
+    #[cfg(not(test))]
+    with(|c| c.save(&crate::settings::app_dir()));
     WATCHERS.lock().unwrap_or_else(|e| e.into_inner()).retain(|tx| tx.unbounded_send(()).is_ok());
 }
 
@@ -464,6 +532,11 @@ mod tests {
         assert_eq!(c.check_write("b", "/wt/p/b/src/lib.rs", 110), WriteCheck::Held { owner: "a".into(), name: "a-nom".into(), intent: "modification".into() });
         assert_eq!(c.check_write("b", "/wt/p/b/src/other.rs", 110), WriteCheck::Granted);
         assert_eq!(c.check_write("a", "/elsewhere/x", 110), WriteCheck::Outside);
+        // Released: b, refused on it, is told it may try again (once).
+        c.release("a", &["src/lib.rs".into()], 111);
+        assert_eq!(c.inbox("b").len(), 1);
+        assert_eq!(c.check_write("a", "src/lib.rs", 100), WriteCheck::Granted);
+        assert!(c.notes.iter().any(|n| n.text == "b-nom refusée sur src/lib.rs, réservé par a-nom"));
         // Renewed by its owner's writes, then expired.
         assert_eq!(c.check_write("a", "src/lib.rs", 100 + LEASE_SECS - 1), WriteCheck::Granted);
         assert!(matches!(c.check_write("b", "src/lib.rs", 100 + LEASE_SECS + 10), WriteCheck::Held { .. }), "renewed");
@@ -483,12 +556,15 @@ mod tests {
         assert_eq!(taken, ["src/ui.rs"]);
         assert_eq!(refused[0], ("src/api.rs".into(), "a-nom".into(), "nouvelle route".into()));
         assert_eq!(refused[1].2, "hors du projet");
-        assert_eq!(c.release("a", &["src/api.rs".into()]), 1);
+        assert_eq!(c.release("a", &["src/api.rs".into()], 2), 1);
         assert_eq!(c.check_write("b", "src/api.rs", 2), WriteCheck::Granted, "released: free");
-        c.force_release(Path::new("/p"), "src/api.rs");
+        c.force_release(Path::new("/p"), "src/api.rs", 2);
         assert_eq!(c.check_write("a", "src/api.rs", 3), WriteCheck::Granted, "forced free");
-        // A session that leaves frees all it held.
+        // A session that leaves frees all it held, and the ones refused on its files are told.
+        assert!(matches!(c.check_write("b", "src/db.rs", 4), WriteCheck::Held { .. }));
+        c.inbox("b");
         c.remove("a");
+        assert!(c.inbox("b")[0].text.contains("src/db.rs est libre"), "told it may try again");
         assert_eq!(c.check_write("b", "src/db.rs", 4), WriteCheck::Granted);
     }
 
@@ -549,6 +625,41 @@ mod tests {
         c.finish_merge(Path::new("/x"), false, "tests en échec".into(), 6);
         assert!(c.inbox("b")[0].text.contains("tests en échec"), "the session is told");
         assert_eq!(c.next_merge().unwrap().1.session, "a");
+    }
+
+    #[test]
+    fn everything_comes_back_after_a_restart() {
+        let dir = std::env::temp_dir().join(format!("akolade-mux-saved-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut c = Coordinator::default();
+        let mut a = info("a", "/x", "/wt/x/a");
+        a.branch = Some("akolade/a".into());
+        a.conversation = Some("conv-a".into());
+        c.add(a);
+        c.add(info("b", "/x", "/wt/x/b"));
+        c.add(info("y", "/y", "/y"));
+        c.claim("a", &["src/api.rs".into()], "route", 100);
+        c.send("b", "y-nom", "hello", 100).unwrap();
+        c.broadcast("a", Scope::Project, "je réserve api.rs", 100);
+        c.request_merge("a", "route", 100).unwrap();
+        c.next_merge();
+        c.save(&dir);
+        let mut back = Coordinator::load(&dir);
+        assert_eq!(back.sessions, c.sessions);
+        assert_eq!(back.messages, c.messages);
+        assert_eq!(back.session("a").unwrap().conversation.as_deref(), Some("conv-a"));
+        assert!(matches!(back.check_write("b", "src/api.rs", 200), WriteCheck::Held { .. }), "the lease is back");
+        let x = &back.projects[&super::super::project::key(Path::new("/x"))];
+        assert!(x.merging.is_none() && x.queue[0].session == "a", "a merge cut short waits again, first");
+        assert_eq!(back.inbox("y").len(), 1);
+        // Nothing left for a project: its file goes.
+        c.force_release(Path::new("/x"), "src/api.rs", 0);
+        c.projects.get_mut(&super::super::project::key(Path::new("/x"))).unwrap().merging = None;
+        c.projects.get_mut(&super::super::project::key(Path::new("/x"))).unwrap().queue.clear();
+        c.projects.get_mut(&super::super::project::key(Path::new("/x"))).unwrap().outcomes.clear();
+        c.save(&dir);
+        assert!(!dir.join("multiplexeur").join(format!("{}.json", super::super::project::key(Path::new("/x")))).exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

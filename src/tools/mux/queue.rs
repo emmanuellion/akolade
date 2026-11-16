@@ -59,7 +59,8 @@ pub fn project_check(dir: &Path) -> Result<String, String> {
         return Ok("Aucun test détecté dans le projet : la fusion n'a pas été vérifiée.".into());
     };
     let report = execute(runner, dir, &[], &std::sync::atomic::AtomicU32::new(0));
-    let failed: Vec<String> = report.tests.iter().filter(|t| t.status == Status::Failed).map(|t| format!("- {} : {}", t.name, t.message.lines().next().unwrap_or_default())).collect();
+    // Each failure with its first lines (the panic's place, then what was expected).
+    let failed: Vec<String> = report.tests.iter().filter(|t| t.status == Status::Failed).map(|t| format!("- {} : {}", t.name, t.message.lines().take(4).collect::<Vec<_>>().join(" "))).collect();
     match (report.error, failed.is_empty()) {
         (Some(e), _) => Err(format!("{} :\n{e}", runner.label())),
         (None, false) => Err(format!("{} : {} en échec\n{}", runner.label(), crate::ui::plural(failed.len(), "test"), failed.join("\n"))),

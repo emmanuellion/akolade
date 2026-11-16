@@ -74,3 +74,30 @@ fn perf_image_decode() {
     });
     println!("PERF décodage PNG 4000×3000 : {d:?}");
 }
+
+/// CPU of a running Akolade (`AKOLADE_PERF_PID`), sampled every second for
+/// `AKOLADE_PERF_SECS` (default 20): its own process, not the `claude` it runs.
+/// Run: AKOLADE_PERF_PID=<pid> cargo test perf_cpu -- --ignored --nocapture
+#[test]
+#[ignore]
+fn perf_cpu_of_a_running_akolade() {
+    let Some(pid) = std::env::var("AKOLADE_PERF_PID").ok() else { return };
+    let secs: u64 = std::env::var("AKOLADE_PERF_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(20);
+    // Cumulated CPU time ("[[dd-]hh:]mm:ss" from `ps -o time=`): the difference over the window is exact.
+    let cpu_time = || -> Option<f64> {
+        let out = crate::platform::command("ps").args(["-o", "time=", "-p", &pid]).output().ok()?;
+        let text = String::from_utf8_lossy(&out.stdout).trim().replace('-', ":");
+        Some(text.split(':').fold(0., |acc, part| acc * 60. + part.parse::<f64>().unwrap_or(0.)))
+    };
+    let (Some(start), t0) = (cpu_time(), Instant::now()) else { return println!("PERF ps indisponible (Windows : utilisez le Gestionnaire des tâches)") };
+    let mut peak: f64 = 0.;
+    let mut last = start;
+    for _ in 0..secs {
+        std::thread::sleep(Duration::from_secs(1));
+        let now = cpu_time().unwrap_or(last);
+        peak = peak.max((now - last) * 100.);
+        last = now;
+    }
+    let avg = (last - start) / t0.elapsed().as_secs_f64() * 100.;
+    println!("PERF CPU d'Akolade sur {secs} s : moyenne {avg:.1} %, pic sur une seconde {peak:.0} %");
+}

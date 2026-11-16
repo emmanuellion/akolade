@@ -161,8 +161,78 @@ Mesures : voir 5.
 
 ## 4. Scénarios de démonstration
 
-*(complétés à l'étape 7)*
+Préparation, commune aux deux scénarios :
+
+```
+scripts/multiplexeur-demo.sh /tmp/akolade-demo
+```
+
+Le script crée quatre petits dépôts :
+- `calc` : une crate Rust avec ses tests, pour le scénario A ;
+- `recettes`, `meteo` et `agenda` : un README chacun, pour le scénario B.
+
+Ensuite, dans Akolade :
+1. Ajoutez l'outil depuis le Store (Outils › Multiplexeur › Ajouter), puis ouvrez-le.
+2. Pour chaque session : « Nouvelle session », collez le chemin du projet, choisissez le modèle Haiku (le moins coûteux pour une démo), puis « Lancer la session ».
+
+La première fois qu'une session part dans un projet, Akolade demande d'approuver ce dossier (mode restreint).
+
+### Scénario A : plusieurs fonctionnalités d'un même projet
+
+Trois sessions sur `/tmp/akolade-demo/calc`. La première est proposée en Directe : choisissez **Isolée**. Les deux suivantes le sont d'office. Toutes les trois sont en « Tout autoriser », pour que la démo avance seule : Akolade rejoue ce mode et vérifie toujours les baux.
+
+| Nom | Tâche |
+|---|---|
+| `mul` | Ajoute dans src/lib.rs une fonction `pub fn mul(a: i64, b: i64) -> i64` avec un test. Réserve d'abord le fichier (claim_files), commite, libère-le, puis appelle request_merge. |
+| `div` | Ajoute dans src/lib.rs une fonction `pub fn div(a: i64, b: i64) -> Option<i64>` (None si b vaut 0) avec un test. Commite, puis appelle request_merge. |
+| `casse` | Modifie `add` dans src/lib.rs pour qu'elle renvoie `a + b + 1`, sans toucher aux tests. Commite, puis appelle request_merge. |
+
+Ce qu'on observe :
+1. Chaque session travaille dans son worktree (barre « Isolée · akolade/mul-1 »…). Votre copie de `calc` ne bouge pas.
+2. `mul` réserve `src/lib.rs` : le bail apparaît sous l'en-tête du projet. Quand `div` (ou `casse`) veut écrire ce fichier, sa carte passe en « Refusé ». Sa barre indique « Bloquée par un bail » et la raison, avec le nom `mul`, s'affiche en infobulle. La session attend ou écrit à `mul`, puis réessaie après la libération (le fil apparaît dans « Échanges »).
+3. Les demandes de fusion passent dans la file du projet, une à la fois. Les branches de `mul` et `div` arrivent sur `akolade/integration` après `cargo test`. Celle de `casse` est renvoyée : `adds` échoue, rien n'est fusionné, et la session reçoit le rapport dans sa conversation.
+4. « Fusionner dans votre branche » apporte `akolade/integration` à `main`, sur votre confirmation. Rien n'est poussé.
+
+### Scénario B : plusieurs projets à la fois
+
+Trois sessions, une par projet : `/tmp/akolade-demo/recettes`, `/meteo` et `/agenda`. Elles sont toutes en **Directe** (le défaut, chacune étant seule sur son projet) et en « Demander ». Tâche de chacune : « Avec l'outil Write, crée NOTES.md contenant une phrase qui décrit ce projet, puis réponds OK. »
+
+Ce qu'on observe :
+1. Trois panneaux côte à côte, chacun dans son dossier. Ni worktree, ni bail, ni file : rien de la coordination ne s'affiche.
+2. Chaque session demande son autorisation dans sa propre carte. Le compteur « 3 sessions en attente de votre accord » s'affiche en haut. Autoriser une session ne débloque qu'elle.
+3. Chaque barre a son coût, chaque projet son total, et le multiplexeur le total général. Les limites de l'abonnement s'affichent une seule fois, comme communes.
+
+### Mixte et messagerie entre projets
+
+Deux sessions Isolées sur `calc` et une Directe sur `meteo`, dans la même vue. Demandez à une session de `calc` : « Envoie à la session de meteo, avec send_message, le texte : la fonction div existe maintenant. » Le message arrive dans la conversation de la session `meteo` (« [Message de … · projet calc] … ») et dans « Échanges ». Les baux et la file de `calc` ne s'affichent pas dans la section de `meteo`, et une demande de fusion de `meteo` serait refusée : elle est en Directe.
+
+### Après un redémarrage
+
+Quittez Akolade et relancez-le, puis rouvrez le Multiplexeur :
+- les sessions reviennent en pause, avec leur conversation, leurs messages et leurs baux ;
+- « Reprendre » relance une session sur la même conversation ;
+- un dossier de `worktrees/` qui n'appartient plus à aucune session est retiré, et son travail non commité est gardé sur sa branche.
 
 ## 5. Mesures
 
-*(complétées à l'étape 7)*
+CPU du processus Akolade seul (sans les `claude`), version release, sur macOS (Apple Silicon), fenêtre de 1 280 × 820 au premier plan. Mesure faite avec `src/perf.rs` (`perf_cpu_of_a_running_akolade`), qui compte le temps CPU consommé par seconde :
+
+```
+AKOLADE_PERF_PID=<pid> AKOLADE_PERF_SECS=40 cargo test perf_cpu -- --ignored --nocapture
+```
+
+Chaque session reçoit la même consigne sans outil (« écris un poème de 60 vers puis une explication de 300 mots », Haiku) : 20 à 45 s de texte en continu.
+
+| Sessions | Pendant l'écriture (moyenne sur 40 s) | Pic sur une seconde | Au repos |
+|---|---|---|---|
+| 1 | 3,5 % | 23 % | — |
+| 3 | 9,1 % | 26 % | — |
+| 6 | 14,6 % | 40 % | 0,6 % |
+
+Les mêmes mesures **avant** les optimisations de l'étape 7 : 37 % pour une session et 69 % pour trois. Ce qui a changé, pour les panneaux du multiplexeur seulement (l'onglet Claude Code garde son rendu) :
+- **Panneaux en cache** (`AnyView::cached`) : un panneau ne se redessine que si sa propre session a changé, pas quand une autre écrit.
+- **Texte regroupé** : le texte reçu s'affiche par lots, au plus dix fois par seconde par session (`ClaudeSession::throttle`), sans la révélation lettre par lettre de l'onglet, qui tourne à 60 images par seconde et analyse à nouveau le Markdown à chaque image.
+- **Indicateurs fixes** : les animations d'attente redessinaient toute la fenêtre à chaque image tant qu'une session réfléchissait. Dans un panneau, l'indicateur est fixe, et la barre dit déjà « En cours ».
+- **Rien quand rien ne bouge** : au-delà de deux rangées, la grille est une `uniform_list` qui ne construit que les rangées visibles ; un panneau replié ne dessine pas sa conversation ; une fenêtre cachée ne se redessine pas.
+
+Au repos, avec 6 sessions ouvertes, Akolade reste à 0,6 % (le README annonce 0,3 % pour l'éditeur seul). Le multiplexeur n'ajoute aucun sondage : ses seuls réveils sont les événements des sessions et du coordinateur.

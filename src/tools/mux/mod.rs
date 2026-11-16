@@ -11,7 +11,7 @@ pub mod worktree;
 
 use std::path::{Path, PathBuf};
 
-use gpui::{AnyElement, AppContext, Context, Entity, FontWeight, Hsla, InteractiveElement, IntoElement, ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Subscription, WeakEntity, Window, div, prelude::FluentBuilder, relative};
+use gpui::{AnyElement, AppContext, Context, Entity, FontWeight, Hsla, InteractiveElement, IntoElement, ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Subscription, WeakEntity, Window, div, prelude::FluentBuilder, relative, uniform_list};
 use gpui_component::{
     ActiveTheme, Disableable, Icon, IconName, Sizable, WindowExt,
     button::ButtonVariants,
@@ -56,6 +56,14 @@ struct Slot {
     _sub: Subscription,
 }
 
+/// Who a message typed in "Échanges" goes to.
+#[derive(Clone, PartialEq)]
+enum Recipient {
+    All,
+    Project(PathBuf),
+    Session(String),
+}
+
 /// A session to start, as the form gave it.
 struct Launch {
     id: String,
@@ -68,6 +76,8 @@ struct Launch {
     perm: usize,
     effort: usize,
     budget: Option<f64>,
+    /// A session restored after a restart: its Claude Code conversation (it comes back paused).
+    conversation: Option<String>,
 }
 
 /// The "Nouvelle session" form.
@@ -96,6 +106,11 @@ pub struct MuxView {
     starting: Vec<String>,
     /// The project (key) whose last merge report is unfolded.
     report: Option<String>,
+    /// The "Échanges" panel: shown, filtered on a project, and its box (to whom: None = all sessions).
+    exchanges: bool,
+    filter: Option<PathBuf>,
+    compose: Entity<InputState>,
+    to: Recipient,
     next_id: u64,
 }
 
@@ -111,8 +126,20 @@ fn name_of(p: &Path) -> String {
 
 impl MuxView {
     pub fn new(workspace: WeakEntity<Workspace>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        // The sessions, messages and leases of last time (Akolade restarted): back, paused.
+        let saved = coord::Coordinator::load(&crate::settings::app_dir());
+        let restored = saved.sessions.clone();
+        coord::with(|c| {
+            if c.sessions.is_empty() {
+                *c = saved;
+            }
+        });
         // Worktrees no session uses any more (a crash, a kill): removed, their branches kept.
-        cx.background_executor().spawn(async { worktree::cleanup(&worktree::base(), &[]) }).detach();
+        let base = worktree::base();
+        let mut keep: Vec<PathBuf> = restored.iter().filter(|s| s.mode == WorkMode::Isolated).map(|s| s.checkout.clone()).collect();
+        keep.extend(restored.iter().map(|s| queue::dir(&base, &s.project)));
+        cx.background_executor().spawn(async move { worktree::cleanup(&base, &keep) }).detach();
+        cx.defer_in(window, move |this, window, cx| this.restore(restored, window, cx));
         // Leases, messages, the queue: redrawn when the coordinator changes (from the MCP server too).
         let mut changes = coord::watch();
         cx.spawn_in(window, async move |this, cx| {
@@ -129,7 +156,56 @@ impl MuxView {
             }
         })
         .detach();
-        Self { workspace, slots: vec![], by_project: true, form: None, _form_sub: None, starting: vec![], report: None, next_id: 1 }
+        let compose = cx.new(|cx| InputState::new(window, cx).placeholder("Écrire…"));
+        Self { workspace, slots: vec![], by_project: true, form: None, _form_sub: None, starting: vec![], report: None, exchanges: false, filter: None, compose, to: Recipient::All, next_id: 1 }
+    }
+
+    /// The saved sessions as panels again, paused on their conversation; an Isolated one's
+    /// worktree made again from its branch if it went (cleaned up, deleted by hand).
+    fn restore(&mut self, sessions: Vec<coord::SessionInfo>, window: &mut Window, cx: &mut Context<Self>) {
+        for mut info in sessions {
+            let n = info.id.rsplit('-').next().and_then(|n| n.parse::<u64>().ok()).unwrap_or(0);
+            self.next_id = self.next_id.max(n + 1);
+            let worktree = match info.mode {
+                WorkMode::Direct => None,
+                WorkMode::Isolated => {
+                    let mut wt = info.checkout.clone();
+                    let known = crate::git::worktree_list(&info.project).iter().any(|(p, _)| crate::platform::canonical(p).ok() == crate::platform::canonical(&wt).ok());
+                    if !known || !wt.join(".git").exists() {
+                        let slug = info.branch.as_deref().and_then(|b| b.strip_prefix("akolade/")).unwrap_or(&info.id).to_string();
+                        match worktree::create(&worktree::base(), &info.project, &slug) {
+                            // Made again (maybe elsewhere): its folder, in the same subfolder as before.
+                            Ok(made) => {
+                                let rel = info.cwd.strip_prefix(&info.checkout).map(Path::to_path_buf).unwrap_or_default();
+                                info.cwd = made.join(rel);
+                                wt = made;
+                            }
+                            Err(e) => {
+                                window.push_notification(gpui_component::notification::Notification::error(format!("« {} » n'a pas pu revenir : {e}", info.name)), cx);
+                                coord::with(|c| c.remove(&info.id));
+                                continue;
+                            }
+                        }
+                    }
+                    crate::trust::link(&wt, &info.project);
+                    Some(wt)
+                }
+            };
+            let launch = Launch {
+                id: info.id,
+                name: info.name,
+                role: info.role,
+                task: String::new(),
+                project: info.project,
+                mode: info.mode,
+                model: info.model,
+                perm: info.perm,
+                effort: info.effort,
+                budget: info.budget,
+                conversation: Some(info.conversation.unwrap_or_default()).filter(|c| !c.is_empty()),
+            };
+            self.start(launch, info.cwd, worktree, window, cx);
+        }
     }
 
     /// The projects in order of first appearance (their colors).
@@ -246,7 +322,7 @@ impl MuxView {
         let project = project::project_of(&folder);
         let id = format!("{}-{}", project::slug(&name), self.next_id);
         self.next_id += 1;
-        let launch = Launch { id, name, role, task, project, mode, model, perm, effort, budget };
+        let launch = Launch { id, name, role, task, project, mode, model, perm, effort, budget, conversation: None };
         self.form = None;
         if mode == WorkMode::Direct {
             return self.start(launch, folder, None, window, cx);
@@ -289,7 +365,7 @@ impl MuxView {
                 checkout,
                 mode: l.mode,
                 branch: branch.clone(),
-                conversation: None,
+                conversation: l.conversation.clone(),
                 model: l.model,
                 perm: l.perm,
                 effort: l.effort,
@@ -317,18 +393,31 @@ impl MuxView {
         let sub = cx.observe(&session, |this, session, cx| {
             let s = session.read(cx);
             let now = (s.state(), (s.cost() * 10_000.) as u64);
-            if let Some(slot) = this.slots.iter_mut().find(|slot| slot.session == session)
-                && slot.seen != now
-            {
+            let conversation = s.conversation().map(str::to_string);
+            let Some(slot) = this.slots.iter_mut().find(|slot| slot.session == session) else { return };
+            // Its conversation's id, saved: after a restart it goes on with it.
+            let id = slot.id.clone();
+            if conversation.is_some() && coord::with(|c| c.session(&id).map(|i| i.conversation.clone())) != Some(conversation.clone()) {
+                coord::with(|c| {
+                    if let Some(info) = c.sessions.iter_mut().find(|i| i.id == id) {
+                        info.conversation = conversation;
+                    }
+                });
+                coord::changed();
+            }
+            if slot.seen != now {
                 slot.seen = now;
                 cx.notify();
             }
         });
-        if !l.task.is_empty() {
+        let restored = l.conversation.is_some();
+        if let Some(conv) = l.conversation.clone() {
+            session.update(cx, |s, cx| s.resume(conv, cx));
+        } else if !l.task.is_empty() {
             session.update(cx, |s, cx| s.submit(l.task, window, cx));
         }
         let project = l.project.clone();
-        self.slots.push(Slot { id: l.id, name: l.name, role: l.role, project: l.project, cwd, mode: l.mode, branch, worktree, session, folded: false, paused: false, seen: (SessionState::Idle, 0), _sub: sub });
+        self.slots.push(Slot { id: l.id, name: l.name, role: l.role, project: l.project, cwd, mode: l.mode, branch, worktree, session, folded: false, paused: restored, seen: (SessionState::Idle, 0), _sub: sub });
         self.refresh_prompts(&project, cx);
         coord::changed();
         cx.notify();
@@ -603,11 +692,115 @@ impl MuxView {
         )
     }
 
+    /// What you type in "Échanges", to its recipients (pushed to them at once, see `deliver`).
+    fn send_compose(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let text = self.compose.read(cx).value().trim().to_string();
+        if text.is_empty() {
+            return;
+        }
+        let (ids, label): (Vec<String>, String) = match &self.to {
+            Recipient::All => (self.slots.iter().map(|s| s.id.clone()).collect(), "toutes les sessions".into()),
+            Recipient::Project(p) => (self.slots.iter().filter(|s| s.project == *p).map(|s| s.id.clone()).collect(), format!("projet {}", name_of(p))),
+            Recipient::Session(id) => (vec![id.clone()], self.slots.iter().find(|s| s.id == *id).map_or(id.clone(), |s| s.name.clone())),
+        };
+        if ids.is_empty() {
+            return;
+        }
+        coord::with(|c| c.send_from_user(ids, label, &text, coord::now()));
+        self.compose.update(cx, |i, cx| i.set_value("", window, cx));
+        coord::changed();
+    }
+
+    /// The thread of messages and coordination events, newest last, filtered on a project.
+    fn render_exchanges(&self, cx: &mut Context<Self>) -> AnyElement {
+        let (messages, notes, names) = coord::with(|c| (c.messages.clone(), c.notes.clone(), c.sessions.iter().map(|s| (s.id.clone(), s.name.clone(), s.project.clone())).collect::<Vec<_>>()));
+        let who = |id: &str| match id {
+            "vous" => "Vous".to_string(),
+            "akolade" => "Akolade".to_string(),
+            id => names.iter().find(|(i, _, _)| i == id).map_or(id.to_string(), |(_, n, _)| n.clone()),
+        };
+        let filter = self.filter.clone();
+        let concerns = |project: &Option<PathBuf>, ids: &[String]| match &filter {
+            None => true,
+            Some(f) => project.as_ref() == Some(f) || ids.iter().any(|id| names.iter().any(|(i, _, p)| i == id && p == f)),
+        };
+        // (time, line, is a message)
+        let mut lines: Vec<(u64, String, bool)> = messages
+            .iter()
+            .filter(|m| concerns(&m.project, std::slice::from_ref(&m.from)) || filter.as_ref().is_some_and(|f| names.iter().any(|(_, n, p)| *n == m.to && p == f)))
+            .map(|m| (m.at, format!("{} → {} : {}", who(&m.from), m.to, m.text), true))
+            .collect();
+        lines.extend(notes.iter().filter(|n| concerns(&n.project, &[])).map(|n| (n.at, n.text.clone(), false)));
+        lines.sort_by_key(|l| l.0);
+        let lines = lines.split_off(lines.len().saturating_sub(200));
+        let theme = cx.theme();
+        let (muted, border, fg) = (theme.muted_foreground, theme.border, theme.foreground);
+        let chip = |id: SharedString, label: String, on: bool| button(id).xsmall().map(|b| if on { b.primary() } else { b.ghost() }).label(label);
+        let projects = self.projects();
+        let filters = h_flex()
+            .flex_wrap()
+            .gap(r(4.))
+            .child(chip("mux-filter-all".into(), "Tous".into(), self.filter.is_none()).on_click(cx.listener(|this, _, _, cx| {
+                this.filter = None;
+                cx.notify();
+            })))
+            .children(projects.iter().enumerate().map(|(i, p)| {
+                let p2 = p.clone();
+                chip(format!("mux-filter-{i}").into(), name_of(p), self.filter.as_ref() == Some(p)).on_click(cx.listener(move |this, _, _, cx| {
+                    this.filter = Some(p2.clone());
+                    cx.notify();
+                }))
+            }));
+        let mut targets: Vec<(Recipient, String)> = vec![(Recipient::All, "Toutes".into())];
+        targets.extend(projects.iter().map(|p| (Recipient::Project(p.clone()), format!("Projet {}", name_of(p)))));
+        targets.extend(self.slots.iter().map(|s| (Recipient::Session(s.id.clone()), s.name.clone())));
+        let to = h_flex().flex_wrap().gap(r(4.)).child(div().text_size(r(11.5)).text_color(muted).child("À :")).children(targets.into_iter().enumerate().map(|(i, (t, label))| {
+            let on = self.to == t;
+            chip(format!("mux-to-{i}").into(), label, on).on_click(cx.listener(move |this, _, _, cx| {
+                this.to = t.clone();
+                cx.notify();
+            }))
+        }));
+        v_flex()
+            .w(r(320.))
+            .flex_shrink_0()
+            .h_full()
+            .border_l_1()
+            .border_color(border)
+            .child(v_flex().flex_shrink_0().gap(r(8.)).p(r(12.)).border_b_1().border_color(border).child(ui::section_title("Échanges", cx)).child(filters))
+            .child(
+                v_flex()
+                    .id("mux-thread")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .p(r(12.))
+                    .gap(r(6.))
+                    .text_size(r(12.))
+                    .when(lines.is_empty(), |d| d.child(div().text_color(muted).child("Les messages entre sessions et les événements de coordination (réservations, fusions) s'affichent ici.")))
+                    .children(lines.into_iter().map(|(at, text, message)| {
+                        let time = chrono::DateTime::from_timestamp(at as i64, 0).map(|t| t.with_timezone(&chrono::Local).format("%H:%M").to_string()).unwrap_or_default();
+                        h_flex().flex_shrink_0().items_start().gap(r(6.)).child(div().flex_shrink_0().text_color(muted).child(time)).child(div().min_w_0().text_color(if message { fg } else { muted }).child(text))
+                    })),
+            )
+            .child(
+                v_flex()
+                    .flex_shrink_0()
+                    .gap(r(6.))
+                    .p(r(12.))
+                    .border_t_1()
+                    .border_color(border)
+                    .child(to)
+                    .child(h_flex().gap(r(6.)).child(div().flex_1().child(Input::new(&self.compose).small())).child(button("mux-send").small().primary().icon(IconName::ArrowUp).tooltip("Envoyer : le message arrive aussitôt aux sessions").on_click(cx.listener(|this, _, window, cx| this.send_compose(window, cx))))),
+            )
+            .into_any_element()
+    }
+
     /// A session's bar: who, where, how, what it does and costs, and its buttons.
     fn render_bar(&self, ix: usize, flat: bool, cx: &mut Context<Self>) -> AnyElement {
         let slot = &self.slots[ix];
         let s = slot.session.read(cx);
-        let (state, cost) = (s.state(), s.cost());
+        let (state, cost, blocked) = (s.state(), s.cost(), s.blocked().map(str::to_string));
         let color = self.color_of(&slot.project, cx);
         let theme = cx.theme();
         let (muted, border, yellow, red, green) = (theme.muted_foreground, theme.border, theme.yellow, theme.red, theme.green);
@@ -620,32 +813,52 @@ impl MuxView {
         };
         let pill = |text: String, c: Hsla| div().flex_shrink_0().px(r(6.)).py(r(1.)).rounded(r(4.)).bg(c.opacity(0.14)).text_color(c).text_size(r(11.)).child(text);
         let working = state == SessionState::Working;
-        h_flex()
-            .flex_shrink_0()
-            .gap(r(8.))
-            .px(r(10.))
-            .py(r(6.))
-            .border_b_1()
-            .border_color(border)
-            .when(state == SessionState::Waiting, |d| d.bg(yellow.opacity(0.08)))
-            .child(div().size(r(8.)).flex_shrink_0().rounded_full().bg(color))
-            .child(div().flex_shrink_0().text_size(r(13.)).font_weight(FontWeight::SEMIBOLD).child(slot.name.clone()))
-            .when(flat, |d| d.child(div().flex_shrink_0().text_size(r(12.)).text_color(color).child(name_of(&slot.project))))
-            .when(!slot.role.is_empty(), |d| d.child(div().min_w_0().truncate().text_size(r(12.)).text_color(muted).child(slot.role.clone())))
-            .child(div().flex_1())
+        // Second line: how and where it works, its role (narrow panels keep the first line's buttons).
+        let details = h_flex()
+            .gap(r(6.))
+            .min_w_0()
             .child(pill(match &slot.branch {
                 Some(b) => format!("{} · {b}", slot.mode.label()),
                 None => slot.mode.label().into(),
             }, muted))
-            .child(pill(state_label.into(), state_color))
             .when(slot.paused, |d| d.child(pill("En pause".into(), muted)))
             .child(div().flex_shrink_0().text_size(r(12.)).text_color(muted).child(claude::usd(cost)))
+            .when(!slot.role.is_empty(), |d| d.child(div().min_w_0().truncate().text_size(r(12.)).text_color(muted).child(slot.role.clone())));
+        let top = h_flex()
+            .gap(r(6.))
+            .min_w_0()
+            .child(div().size(r(8.)).flex_shrink_0().rounded_full().bg(color))
+            .child({
+                let tip = format!("Travaille dans {}", slot.cwd.display());
+                div().id(SharedString::from(format!("mux-name-{}", slot.id))).flex_shrink_0().max_w(r(160.)).truncate().text_size(r(13.)).font_weight(FontWeight::SEMIBOLD).child(slot.name.clone()).tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+            })
+            .when(flat, |d| d.child(div().flex_shrink_0().text_size(r(12.)).text_color(color).child(name_of(&slot.project))))
+            .child(div().flex_1())
+            .child(div().id(SharedString::from(format!("mux-state-{}", slot.id))).child(pill(state_label.into(), state_color)).when_some(blocked, |d, why| d.tooltip(move |window, cx| Tooltip::new(why.clone()).build(window, cx))))
             .map(|d| {
                 if slot.paused {
                     d.child(button(SharedString::from(format!("mux-resume-{}", slot.id))).ghost().xsmall().label("Reprendre").tooltip("Elle reprend là où elle s'était arrêtée").on_click(cx.listener(move |this, _, window, cx| this.resume(ix, window, cx))))
                 } else {
                     d.child(button(SharedString::from(format!("mux-pause-{}", slot.id))).ghost().xsmall().label("Pause").tooltip("Interrompt son tour ; « Reprendre » la relance").disabled(!working).on_click(cx.listener(move |this, _, _, cx| this.pause(ix, cx))))
                 }
+            })
+            .when_some(slot.worktree.clone().filter(|_| !working), |d, wt| {
+                d.child(button(SharedString::from(format!("mux-rebase-{}", slot.id))).ghost().xsmall().icon(Icon::empty().path("icons/git-pull-request.svg").xsmall()).tooltip("Rebaser sur akolade/integration : sa branche reprend ce que les autres ont déjà fait fusionner (annulé en cas de conflit)").on_click(cx.listener(move |_, _, window, cx| {
+                    let wt = wt.clone();
+                    let task = cx.background_executor().spawn(async move { crate::git::rebase(&wt, queue::BRANCH) });
+                    cx.spawn_in(window, async move |_, cx| {
+                        let done = task.await;
+                        let _ = cx.update(|window, cx| {
+                            let note = match done {
+                                crate::git::Integration::Done => gpui_component::notification::Notification::success("Branche rebasée sur akolade/integration."),
+                                crate::git::Integration::Conflict(files) => gpui_component::notification::Notification::error(format!("Conflit sur {} : le rebase est annulé, demandez à la session de le faire elle-même.", files.join(", "))),
+                                crate::git::Integration::Failed(e) => gpui_component::notification::Notification::error(format!("Rebase impossible : {e}")),
+                            };
+                            window.push_notification(note, cx);
+                        });
+                    })
+                    .detach();
+                })))
             })
             .child(
                 button(SharedString::from(format!("mux-fold-{}", slot.id)))
@@ -667,7 +880,17 @@ impl MuxView {
                     .icon(Icon::new(IconName::Close).xsmall())
                     .tooltip("Arrêter et fermer la session")
                     .on_click(cx.listener(move |this, _, _, cx| this.close(ix, cx))),
-            )
+            );
+        v_flex()
+            .flex_shrink_0()
+            .gap(r(4.))
+            .px(r(10.))
+            .py(r(6.))
+            .border_b_1()
+            .border_color(border)
+            .when(state == SessionState::Waiting, |d| d.bg(yellow.opacity(0.08)))
+            .child(top)
+            .child(details)
             .into_any_element()
     }
 
@@ -682,7 +905,8 @@ impl MuxView {
             .rounded(r(8.))
             .overflow_hidden()
             .child(self.render_bar(ix, flat, cx))
-            .when(!slot.folded, |d| d.child(div().flex_1().min_h_0().child(slot.session.clone())))
+            // Cached: a panel is drawn again only when its own session changed, not when another one streams.
+            .when(!slot.folded, |d| d.child(div().flex_1().min_h_0().child(gpui::AnyView::from(slot.session.clone()).cached(gpui::StyleRefinement::default().size_full()))))
             .into_any_element()
     }
 
@@ -718,7 +942,7 @@ impl MuxView {
                             .icon(Icon::new(IconName::Close).xsmall())
                             .tooltip(format!("Libérer de force ({})", l.intent))
                             .on_click(cx.listener(move |_, _, _, cx| {
-                                coord::with(|c| c.force_release(&project, &path));
+                                coord::with(|c| c.force_release(&project, &path, coord::now()));
                                 coord::changed();
                                 cx.notify();
                             })),
@@ -729,47 +953,83 @@ impl MuxView {
 
     /// The sessions' panels: rows of up to three, resizable both ways; one section per project, or flat.
     fn render_grid(&self, cx: &mut Context<Self>) -> AnyElement {
+        // By project: a section per shared project (its leases, its queue); the projects with one
+        // session and nothing to show share rows, each bar naming its project (usage B side by side).
         let groups: Vec<(Option<PathBuf>, Vec<usize>)> = if self.by_project {
-            self.projects().into_iter().map(|p| {
-                let ixs = (0..self.slots.len()).filter(|&i| self.slots[i].project == p).collect();
-                (Some(p), ixs)
-            }).collect()
+            let mut groups = vec![];
+            let mut solo = vec![];
+            for p in self.projects() {
+                let ixs: Vec<usize> = (0..self.slots.len()).filter(|&i| self.slots[i].project == p).collect();
+                let busy_queue = coord::with(|c| c.projects.get(&project::key(&p)).is_some_and(|s| !s.queue.is_empty() || s.merging.is_some() || !s.outcomes.is_empty()));
+                if ixs.len() == 1 && !busy_queue {
+                    solo.extend(ixs);
+                } else {
+                    groups.push((Some(p), ixs));
+                }
+            }
+            if !solo.is_empty() {
+                groups.push((None, solo));
+            }
+            groups
         } else {
             vec![(None, (0..self.slots.len()).collect())]
         };
-        let theme = cx.theme();
-        let muted = theme.muted_foreground;
-        let mut rows: Vec<AnyElement> = vec![];
-        for (project, ixs) in groups {
-            for (n, chunk) in ixs.chunks(3).enumerate() {
-                let key = project.as_deref().map(project::key).unwrap_or_else(|| "flat".into());
-                let panels: Vec<AnyElement> = chunk.iter().map(|&i| self.render_panel(i, project.is_none(), cx)).collect();
-                let section = project.as_ref().filter(|_| n == 0).map(|p| {
-                    let cost: f64 = ixs.iter().map(|&i| self.slots[i].session.read(cx).cost()).sum();
-                    let color = self.color_of(p, cx);
-                    h_flex()
-                        .flex_shrink_0()
-                        .gap(r(8.))
-                        .px(r(4.))
-                        .pb(r(6.))
-                        .child(div().size(r(10.)).rounded_full().bg(color))
-                        .child(div().text_size(r(13.5)).font_weight(FontWeight::SEMIBOLD).child(name_of(p)))
-                        .child(div().min_w_0().truncate().text_size(r(12.)).text_color(muted).child(p.display().to_string()))
-                        .child(div().flex_1())
-                        .child(div().flex_shrink_0().text_size(r(12.)).text_color(muted).child(format!("{} · {}", ui::plural(ixs.len(), "session"), claude::usd(cost))))
-                });
-                let row = h_resizable(SharedString::from(format!("mux-row-{key}-{n}"))).children(panels.into_iter().map(|p| resizable_panel().child(div().size_full().p(r(4.)).child(p))));
-                // A shared project: its leases, each with its forced release.
-                let leases = project.as_ref().filter(|_| n == 0 && ixs.len() > 1).map(|p| self.render_leases(p, cx));
-                let queue = project.as_ref().filter(|_| n == 0).and_then(|p| self.render_queue(p, cx));
-                rows.push(v_flex().size_full().p(r(6.)).children(section).children(leases).children(queue).child(div().flex_1().min_h_0().child(row)).into_any_element());
+        // One row per chunk of up to three panels: (its group's project, its index in the group, its panels, the group's).
+        let rows: Vec<Row> = groups.into_iter().flat_map(|(project, ixs)| {
+            ixs.chunks(3).enumerate().map(|(n, chunk)| Row { project: project.clone(), n, panels: chunk.to_vec(), group: ixs.clone() }).collect::<Vec<_>>()
+        }).collect();
+        match rows.len() {
+            0 => div().into_any_element(),
+            1 => self.render_row(&rows[0], cx),
+            // Two rows share the height, resizable.
+            2 => {
+                let both: Vec<AnyElement> = rows.iter().map(|row| self.render_row(row, cx)).collect();
+                v_resizable("mux-rows").children(both.into_iter().map(|row| resizable_panel().child(row))).into_any_element()
             }
+            // More: each its own height, the grid scrolls; only the rows on screen are built and drawn.
+            n => uniform_list("mux-grid", n, cx.processor(move |this, range: std::ops::Range<usize>, _, cx| {
+                range.filter_map(|i| rows.get(i)).map(|row| div().h(r(460.)).child(this.render_row(row, cx)).into_any_element()).collect::<Vec<_>>()
+            }))
+            .size_full()
+            .into_any_element(),
         }
-        if rows.len() == 1 {
-            return rows.pop().unwrap_or_else(|| div().into_any_element());
-        }
-        v_resizable("mux-rows").children(rows.into_iter().map(|row| resizable_panel().child(row))).into_any_element()
     }
+
+    /// A row of the grid: its project's header first (leases, queue) when it starts a shared project's section.
+    fn render_row(&self, row: &Row, cx: &mut Context<Self>) -> AnyElement {
+        let muted = cx.theme().muted_foreground;
+        let (project, n, ixs) = (&row.project, row.n, &row.group);
+        let key = project.as_deref().map(project::key).unwrap_or_else(|| "flat".into());
+        let panels: Vec<AnyElement> = row.panels.iter().map(|&i| self.render_panel(i, project.is_none(), cx)).collect();
+        let section = project.as_ref().filter(|_| n == 0).map(|p| {
+            let cost: f64 = ixs.iter().map(|&i| self.slots[i].session.read(cx).cost()).sum();
+            let color = self.color_of(p, cx);
+            h_flex()
+                .flex_shrink_0()
+                .gap(r(8.))
+                .px(r(4.))
+                .pb(r(6.))
+                .child(div().size(r(10.)).rounded_full().bg(color))
+                .child(div().text_size(r(13.5)).font_weight(FontWeight::SEMIBOLD).child(name_of(p)))
+                .child(div().min_w_0().truncate().text_size(r(12.)).text_color(muted).child(p.display().to_string()))
+                .child(div().flex_1())
+                .child(div().flex_shrink_0().text_size(r(12.)).text_color(muted).child(format!("{} · {}", ui::plural(ixs.len(), "session"), claude::usd(cost))))
+        });
+        let grid = h_resizable(SharedString::from(format!("mux-row-{key}-{n}"))).children(panels.into_iter().map(|p| resizable_panel().child(div().size_full().p(r(4.)).child(p))));
+        // A shared project: its leases, each with its forced release.
+        let leases = project.as_ref().filter(|_| n == 0 && ixs.len() > 1).map(|p| self.render_leases(p, cx));
+        let queue = project.as_ref().filter(|_| n == 0).and_then(|p| self.render_queue(p, cx));
+        v_flex().size_full().p(r(6.)).children(section).children(leases).children(queue).child(div().flex_1().min_h_0().child(grid)).into_any_element()
+    }
+}
+
+/// A row of the grid (see `render_grid`).
+#[derive(Clone)]
+struct Row {
+    project: Option<PathBuf>,
+    n: usize,
+    panels: Vec<usize>,
+    group: Vec<usize>,
 }
 
 /// A file as `claude` names it, made comparable with the checkout's canonical root
@@ -873,13 +1133,26 @@ impl Render for MuxView {
                     .text_color(yellow)
                     .text_size(r(12.5))
                     .child(Icon::empty().path("icons/circle-help.svg").xsmall())
-                    .child(format!("{} en attente de votre accord", ui::plural(waiting, "session")))
-                    .tooltip(|window, cx| Tooltip::new("Leurs barres sont surlignées : autorisez ou refusez dans leur panneau.").build(window, cx))
+                    .child(format!("{waiting} en attente"))
+                    .tooltip(move |window, cx| Tooltip::new(format!("{} attendent votre accord : leurs barres sont surlignées, autorisez ou refusez dans leur panneau.", ui::plural(waiting, "session"))).build(window, cx))
                     .into_any_element(),
             );
         }
         if !self.slots.is_empty() {
             actions.push(toggle.into_any_element());
+            let unread = coord::with(|c| c.messages.len() + c.notes.len());
+            actions.push(
+                button("mux-exchanges")
+                    .small()
+                    .map(|b| if self.exchanges { b.primary() } else { b.ghost() })
+                    .icon(Icon::new(IconName::Inbox))
+                    .label(if unread > 0 { format!("Échanges ({unread})") } else { "Échanges".into() })
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.exchanges = !this.exchanges;
+                        cx.notify();
+                    }))
+                    .into_any_element(),
+            );
         }
         actions.push(button("mux-new").small().primary().icon(IconName::Plus).label("Nouvelle session").disabled(self.form.is_some()).on_click(cx.listener(|this, _, window, cx| this.open_form(window, cx))).into_any_element());
         let limits_line = (!limits.is_empty()).then(|| {
@@ -898,7 +1171,13 @@ impl Render for MuxView {
                 .child(button("mux-first").primary().mt(r(8.)).icon(IconName::Plus).label("Nouvelle session").on_click(cx.listener(|this, _, window, cx| this.open_form(window, cx))))
                 .into_any_element()
         } else {
-            div().flex_1().min_h_0().p(r(10.)).child(self.render_grid(cx)).into_any_element()
+            h_flex()
+                .flex_1()
+                .min_h_0()
+                .size_full()
+                .child(div().flex_1().min_w_0().h_full().p(r(10.)).child(self.render_grid(cx)))
+                .when(self.exchanges, |d| d.child(self.render_exchanges(cx)))
+                .into_any_element()
         };
         v_flex()
             .size_full()

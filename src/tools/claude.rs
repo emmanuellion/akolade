@@ -758,6 +758,11 @@ pub struct ClaudeSession {
     reveal: Option<(usize, usize)>,
     /// The letter-by-letter loop runs (`tick`).
     ticking: bool,
+    /// A batched redraw is coming (`throttle`).
+    frame_due: bool,
+    /// A multiplexer panel's model and mode choices, unfolded.
+    show_choices: bool,
+    _frame: Task<()>,
     _tick: Task<()>,
     /// The mods' band above the box, their panes (id, title, drawing), status lines, last toast.
     band: Option<Value>,
@@ -783,7 +788,8 @@ pub struct ClaudeSession {
 
 impl ClaudeSession {
     pub fn new(workspace: WeakEntity<Workspace>, root: Option<PathBuf>, opts: SessionOptions, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let input = cx.new(|cx| InputState::new(window, cx).multi_line(true).auto_grow(2, 10).placeholder("Demandez quelque chose à Claude…"));
+        // A multiplexer panel is short: one line to start with.
+        let input = cx.new(|cx| InputState::new(window, cx).multi_line(true).auto_grow(if opts.chrome { 2 } else { 1 }, 10).placeholder("Demandez quelque chose à Claude…"));
         let subs = vec![
             cx.observe_global::<AppSettings>(|this, cx| this.apply_settings(cx)),
             // The `/` suggestions follow what is typed. A first `/`: `claude` starts (no
@@ -837,6 +843,9 @@ impl ClaudeSession {
             queued: vec![],
             reveal: None,
             ticking: false,
+            frame_due: false,
+            show_choices: false,
+            _frame: Task::ready(()),
             _tick: Task::ready(()),
             band: None,
             panes: vec![],
@@ -1340,6 +1349,8 @@ impl ClaudeSession {
     fn apply(&mut self, e: Event, window: &mut Window, cx: &mut Context<Self>) {
         // Cards before the last two that change height (see `sync_log`).
         self.relayout |= matches!(e, Event::ToolResult { .. } | Event::Ask { .. } | Event::Exit);
+        // A multiplexer panel draws streamed text in batches (see `throttle`), without the letter-by-letter reveal.
+        let streamed = !self.opts.chrome && matches!(e, Event::Text(_) | Event::TextStart);
         match e {
             Event::Init { session, model, subscription } => {
                 if self.session.is_none() {
@@ -1350,7 +1361,9 @@ impl ClaudeSession {
             Event::TextStart => {
                 (self.busy, self.thinking) = (true, false);
                 self.items.push(Item::Text(String::new()));
-                self.reveal = Some((self.items.len() - 1, 0));
+                if self.opts.chrome {
+                    self.reveal = Some((self.items.len() - 1, 0));
+                }
             }
             Event::Text(t) => {
                 self.thinking = false;
@@ -1358,10 +1371,14 @@ impl ClaudeSession {
                     Some(Item::Text(s)) => s.push_str(&t),
                     _ => {
                         self.items.push(Item::Text(t));
-                        self.reveal = Some((self.items.len() - 1, 0));
+                        if self.opts.chrome {
+                            self.reveal = Some((self.items.len() - 1, 0));
+                        }
                     }
                 }
-                self.tick(cx);
+                if self.opts.chrome {
+                    self.tick(cx);
+                }
             }
             // Claude at work, also on a turn a mod started (its band's "Review").
             Event::Thinking => (self.busy, self.thinking) = (true, true),
@@ -1526,7 +1543,23 @@ impl ClaudeSession {
                 self.end_turn();
             }
         }
-        cx.notify();
+        if streamed { self.throttle(cx) } else { cx.notify() }
+    }
+
+    /// One redraw for what streamed in the last tenth of a second: N panels streaming at
+    /// once redraw at most ten times a second each, not at every word.
+    fn throttle(&mut self, cx: &mut Context<Self>) {
+        if self.frame_due {
+            return;
+        }
+        self.frame_due = true;
+        self._frame = cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_millis(100)).await;
+            let _ = this.update(cx, |this, cx| {
+                this.frame_due = false;
+                cx.notify();
+            });
+        });
     }
 
     /// Tells the list what changed since the last frame: cards added, the last
@@ -1757,7 +1790,7 @@ impl ClaudeSession {
     }
 
     /// Back in a past conversation: shown as it was, the next message goes on with it.
-    fn resume(&mut self, id: String, cx: &mut Context<Self>) {
+    pub(crate) fn resume(&mut self, id: String, cx: &mut Context<Self>) {
         let Some(path) = self.root.as_deref().and_then(sessions_dir).map(|d| d.join(format!("{id}.jsonl"))) else { return };
         self.reset(cx);
         (self.session, self.show_past) = (Some(id.clone()), false);
@@ -1827,10 +1860,30 @@ impl ClaudeSession {
         in_terminal(&self.workspace, &command, window, cx);
     }
 
+    /// A file of a card in the editor. A session in its own folder (the multiplexer's)
+    /// may name a file of another project than the editor's: open that project, or the file alone.
     fn open(&self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(ws) = self.workspace.upgrade() {
-            ws.update(cx, |ws, cx| ws.open_path(path, window, cx));
-        }
+        let Some(ws) = self.workspace.upgrade() else { return };
+        let editor_root = ws.read(cx).root().map(Path::to_path_buf);
+        let elsewhere = !self.opts.follow_editor && editor_root.as_ref().is_none_or(|r| !path.starts_with(r));
+        let Some(project) = self.root.clone().filter(|_| elsewhere) else {
+            return ws.update(cx, |ws, cx| ws.open_path(path, window, cx));
+        };
+        let detail = format!("{} n'est pas dans le projet ouvert dans l'éditeur. Ouvrir « {} » (ses onglets et son explorateur remplacent ceux du projet actuel) ou seulement ce fichier ?", path.display(), project.display());
+        let answer = window.prompt(PromptLevel::Info, "Fichier d'un autre projet", Some(&detail), &["Ouvrir le projet", "Seulement le fichier", "Annuler"], cx);
+        let ws = ws.downgrade();
+        cx.spawn_in(window, async move |_, cx| {
+            let choice = answer.await.unwrap_or(2);
+            let _ = ws.update_in(cx, |ws, window, cx| match choice {
+                0 => {
+                    ws.set_root(Some(project), window, cx);
+                    ws.open_path(path, window, cx);
+                }
+                1 => ws.open_path(path, window, cx),
+                _ => {}
+            });
+        })
+        .detach();
     }
 
     // ------------------------------------------------------------ render
@@ -1841,13 +1894,15 @@ impl ClaudeSession {
         let (fg, muted, primary_fg, red) = (theme.foreground, theme.muted_foreground, theme.primary_foreground, theme.red);
         let primary = if danger == Some(on) { red } else { theme.primary };
         let busy = self.busy;
+        // A multiplexer panel is narrow: tighter choices.
+        let (pad, size) = if self.opts.chrome { (9., 12.) } else { (5., 11.5) };
         h_flex().flex_shrink_0().p(r(2.)).gap(r(2.)).rounded(r(8.)).bg(fg.opacity(0.05)).children(labels.into_iter().enumerate().map(|(i, (text, tip))| {
             div()
                 .id(SharedString::from(format!("{id}-{i}")))
-                .px(r(9.))
+                .px(r(pad))
                 .py(r(4.))
                 .rounded(r(6.))
-                .text_size(r(12.))
+                .text_size(r(size))
                 .font_weight(FontWeight::MEDIUM)
                 .map(|d| if i == on { d.bg(primary).text_color(primary_fg) } else { d.text_color(muted) })
                 .when(!busy && i != on, |d| d.cursor_pointer().hover(|d| d.text_color(fg)))
@@ -1871,7 +1926,9 @@ impl ClaudeSession {
         let status: AnyElement = match result {
             _ if pending => note(if question { "En attente de votre réponse" } else { "En attente de votre accord" }, yellow),
             _ if refused => note("Refusé", red),
-            None if self.busy => Spinner::new().xsmall().color(muted).into_any_element(),
+            // In a multiplexer panel, still: an animation redraws the whole window at each frame.
+            None if self.busy && self.opts.chrome => Spinner::new().xsmall().color(muted).into_any_element(),
+            None if self.busy => Icon::new(IconName::Ellipsis).xsmall().text_color(muted).into_any_element(),
             None => div().into_any_element(),
             Some((_, false)) => Icon::new(IconName::Check).xsmall().text_color(green).into_any_element(),
             Some((_, true)) => Icon::new(IconName::Close).xsmall().text_color(red).into_any_element(),
@@ -2272,7 +2329,7 @@ impl ClaudeSession {
                 .children(self.toast.as_ref().map(|(plugin, text)| h_flex().gap(r(6.)).child(div().font_weight(FontWeight::SEMIBOLD).text_color(theme.primary).child(plugin.clone())).child(div().min_w_0().truncate().child(text.clone()))))
                 .children(self.statuses.iter().map(|(plugin, text)| h_flex().gap(r(6.)).child(div().font_weight(FontWeight::SEMIBOLD).child(plugin.clone())).child(div().min_w_0().truncate().child(text.clone()))))
         });
-        h_flex().flex_shrink_0().justify_center().px(r(24.)).pb(r(16.)).pt(r(6.)).child(
+        h_flex().flex_shrink_0().justify_center().px(r(if self.opts.chrome { 24. } else { 8. })).pb(r(if self.opts.chrome { 16. } else { 8. })).pt(r(6.)).child(
             v_flex()
                 .w_full()
                 .max_w(r(800.))
@@ -2287,27 +2344,49 @@ impl ClaudeSession {
                 .capture_action(cx.listener(Self::paste))
                 .capture_action(cx.listener(Self::enter))
                 .capture_action(cx.listener(Self::tab))
-                .children(band)
-                .child(self.render_folder("composer-folder", cx))
+                // The mods' band in the Claude Code tab only: a multiplexer panel is too short for it.
+                .when(self.opts.chrome, |d| d.children(band))
+                .when(self.opts.chrome, |d| d.child(self.render_folder("composer-folder", cx)))
                 .children(queued)
                 .when(!self.attachments.is_empty(), |d| d.child(self.render_attachments(cx)))
                 .children(slash)
                 .child(Input::new(&self.input).appearance(false).text_size(r(14.)))
-                .child(
-                    // Two rows, not one that wraps (gpui measures a wrapped row one line high and
-                    // it spills out of the box): the model and the keys, then the mode and sending.
-                    v_flex()
-                        .gap(r(8.))
-                        .child(
+                .map(|d| {
+                    if !self.opts.chrome && !self.show_choices {
+                        // A multiplexer panel: the model and mode in one word, unfolded on demand; sending at the right.
+                        let summary = format!("{} · {}", MODELS[self.model].0, MODES[self.mode].0);
+                        return d.child(
                             h_flex()
                                 .gap(r(8.))
-                                .child(models)
-                                .child(div().min_w_0().children(chip))
+                                .child(button("claude-choices").ghost().xsmall().label(summary).icon(Icon::new(IconName::ChevronDown).xsmall()).tooltip("Changer le modèle ou le mode d'autorisation").on_click(cx.listener(|this, _, _, cx| {
+                                    this.show_choices = true;
+                                    cx.notify();
+                                })))
                                 .child(div().flex_1())
-                                .child(div().min_w_0().truncate().text_size(r(11.5)).text_color(muted).child(if cfg!(target_os = "macos") { "⏎ envoyer, ⌘⏎ à la ligne" } else { "Entrée : envoyer, Ctrl+Entrée : à la ligne" })),
-                        )
-                        .child(h_flex().gap(r(8.)).child(modes).child(div().flex_1()).children(stop).child(div().flex_shrink_0().child(send))),
-                )
+                                .children(stop)
+                                .child(div().flex_shrink_0().child(send)),
+                        );
+                    }
+                    // Two rows, not one that wraps (gpui measures a wrapped row one line high and
+                    // it spills out of the box): the model and the keys, then the mode and sending.
+                    d.child(
+                        v_flex()
+                            .gap(r(8.))
+                            .child(
+                                h_flex()
+                                    .gap(r(8.))
+                                    .child(models)
+                                    .child(div().min_w_0().children(chip))
+                                    .child(div().flex_1())
+                                    .when(self.opts.chrome, |d| d.child(div().min_w_0().truncate().text_size(r(11.5)).text_color(muted).child(if cfg!(target_os = "macos") { "⏎ envoyer, ⌘⏎ à la ligne" } else { "Entrée : envoyer, Ctrl+Entrée : à la ligne" })))
+                                    .when(!self.opts.chrome, |d| d.child(button("claude-choices-fold").ghost().xsmall().icon(Icon::new(IconName::ChevronUp).xsmall()).tooltip("Replier").on_click(cx.listener(|this, _, _, cx| {
+                                        this.show_choices = false;
+                                        cx.notify();
+                                    })))),
+                            )
+                            .child(h_flex().gap(r(8.)).child(modes).child(div().flex_1()).children(stop).child(div().flex_shrink_0().child(send))),
+                    )
+                })
                 .children(notes),
         )
     }
@@ -2390,12 +2469,14 @@ impl ClaudeSession {
                     .gap(r(8.))
                     .text_size(r(13.))
                     .text_color(muted)
-                    .when(shown, |d| d.child(Spinner::new().small().color(rgb(ORANGE).into())).child(if working { "Claude travaille…" } else { "Claude réfléchit…" }))
+                    .when(shown && self.opts.chrome, |d| d.child(Spinner::new().small().color(rgb(ORANGE).into())))
+                    .when(shown && !self.opts.chrome, |d| d.child(Icon::new(IconName::Ellipsis).small().text_color(rgb(ORANGE))))
+                    .when(shown, |d| d.child(if working { "Claude travaille…" } else { "Claude réfléchit…" }))
                     .into_any_element()
             }
         };
         // Block layout, centered by margins: cheaper to lay out than a flex row.
-        div().block().px(r(24.)).pt(r(if ix == 0 { 20. } else { 0. })).pb(r(14.)).child(div().block().w_full().max_w(r(800.)).mx_auto().child(content)).into_any_element()
+        div().block().px(r(if self.opts.chrome { 24. } else { 14. })).pt(r(if ix == 0 { 20. } else { 0. })).pb(r(14.)).child(div().block().w_full().max_w(r(800.)).mx_auto().child(content)).into_any_element()
     }
 
     fn render_conversation(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Div {

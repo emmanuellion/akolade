@@ -25,6 +25,7 @@ Akolade dessine son interface sur la carte graphique avec [gpui](https://www.gpu
 
 - [Ce que fait Akolade](#ce-que-fait-akolade)
 - [Claude Code dans l'éditeur](#claude-code-dans-léditeur)
+- [Multiplexeur](#multiplexeur)
 - [Les outils](#les-outils)
 - [Le Store](#le-store)
 - [Sécurité : le mode restreint](#sécurité--le-mode-restreint)
@@ -79,6 +80,25 @@ Si [Claude Code](https://claude.com/code) est installé sur votre ordinateur, Ak
 
 ![Claude Code dans Akolade après un tour : la réponse, les deux fichiers modifiés à garder ou annuler, et le suivi de la session à droite](docs/images/claude.png)
 
+## Multiplexeur
+
+L'outil Multiplexeur fait travailler plusieurs sessions Claude Code en parallèle, dans une seule vue. Deux usages, que l'on peut mélanger :
+
+- **Plusieurs projets à la fois.** Chaque session travaille dans son propre projet, comme l'onglet Claude Code, sans rien partager avec les autres. Le multiplexeur sert de tableau de bord : leurs autorisations, leurs coûts et leur état côte à côte.
+- **Plusieurs fonctionnalités d'un même projet.** Dès qu'une deuxième session rejoint un projet, elle travaille dans son propre worktree Git, sur la branche `akolade/<session>` : rien ne touche votre copie. Les sessions d'un projet se coordonnent pour ne pas modifier les mêmes fichiers en même temps ni casser le projet.
+
+Ce que le multiplexeur apporte :
+
+- **Une grille de sessions redimensionnable**, groupée par projet ou à plat. Chaque panneau a la conversation complète de Claude Code (cartes, autorisations, zone de saisie) et une barre : nom, projet, rôle, mode Directe ou Isolée avec sa branche, état (inactive, en cours, attend votre accord, bloquée par un bail, erreur), coût. Pause, reprise, repli et fermeture se font par session.
+- **Les sessions qui attendent votre accord** sont surlignées et comptées en haut de la vue : aucune ne reste bloquée sans que vous le voyiez.
+- **Les baux de fichiers.** Une session qui modifie un fichier le réserve. Si une autre session du même projet veut l'écrire, Akolade refuse aussitôt, en donnant le nom du détenteur et son intention ; elle réessaie une fois le fichier libéré. Les baux d'un projet n'affectent jamais un autre projet, et vous pouvez en libérer un de force.
+- **Une messagerie.** Les sessions s'écrivent entre elles, même d'un projet à l'autre (une API et son client), par un serveur MCP intégré à Akolade. Le panneau « Échanges » montre le fil des messages et des événements, et vous permet d'écrire à une session, à un projet ou à toutes.
+- **Une file d'intégration par projet.** Une session qui a fini demande la fusion de sa branche. Akolade la fusionne dans `akolade/integration`, une à la fois et dans l'ordre, seulement si le build et les tests passent. Sinon, la session reçoit l'erreur ou la liste des conflits et corrige. Votre branche ne change que sur votre clic « Fusionner dans votre branche ». Rien n'est jamais poussé.
+- **Les réglages par session** : modèle, mode d'autorisation, effort et budget. Les coûts s'affichent par session, par projet et au total. Les limites de l'abonnement sont communes à toutes les sessions.
+- **Après un redémarrage**, les sessions reviennent en pause sur leur conversation, avec leurs messages et leurs baux. Les worktrees abandonnés sont nettoyés, et leur travail non commité est gardé sur leur branche.
+
+Le mode restreint s'applique projet par projet, et un worktree hérite de l'approbation de son projet. L'architecture, les essais du CLI `claude` et deux scénarios de démonstration sont dans [docs/multiplexeur.md](docs/multiplexeur.md).
+
 ## Les outils
 
 Chaque outil ajouté depuis le Store a son icône dans la barre de gauche.
@@ -87,6 +107,7 @@ Chaque outil ajouté depuis le Store a son icône dans la barre de gauche.
 |---|---|
 | Git | Le dépôt : modifications, diff, commits, branches, remises, push et pull |
 | Claude Code | La conversation, les autorisations, le coût et les limites |
+| Multiplexeur | Plusieurs sessions Claude Code en parallèle, sur un projet ou sur plusieurs : baux de fichiers, messagerie, file d'intégration testée |
 | Client HTTP | GET, POST, PUT, PATCH, DELETE avec en-têtes et corps ; la réponse avec son code, sa durée et le JSON mis en forme. Les requêtes s'enregistrent dans le projet |
 | Docker | Démarrer, arrêter, redémarrer ou supprimer un conteneur, lire ses logs, ouvrir un shell |
 | Kubernetes | Pods, déploiements et services par namespace ; logs, shell, mise à l'échelle, redirection de port |
