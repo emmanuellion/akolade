@@ -1,4 +1,4 @@
-//! The integration queue: each project's `akolade/integration` branch, in a worktree of
+//! The integration queue: each project's `integration` branch, in a worktree of
 //! its own, takes the sessions' branches one by one (first asked, first merged), each
 //! only if the project still builds and passes its tests. Never pushed; merged into your
 //! branch only by your click.
@@ -9,7 +9,16 @@ use crate::git::{self, Integration};
 
 use super::{coord::MergeRequest, project};
 
-pub const BRANCH: &str = "akolade/integration";
+pub const BRANCH: &str = "integration";
+/// Its name in 0.2: renamed on first use.
+const OLD_BRANCH: &str = "akolade/integration";
+/// Set on the branch the queue made (`git config branch.integration.multiplexeur`): a
+/// branch `integration` of the user's own is never taken for it.
+const MARK: &str = "branch.integration.multiplexeur";
+
+fn has_branch(project: &Path, branch: &str) -> bool {
+    git::git(project, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")]).is_ok()
+}
 
 pub fn dir(base: &Path, project: &Path) -> PathBuf {
     base.join(project::key(project)).join("integration")
@@ -18,13 +27,22 @@ pub fn dir(base: &Path, project: &Path) -> PathBuf {
 /// The project's integration worktree, made on first use from its current HEAD.
 pub fn prepare(base: &Path, project: &Path) -> Result<PathBuf, String> {
     let dir = dir(base, project);
+    // 0.2's branch: renamed (its worktree follows), its config with it.
+    if has_branch(project, OLD_BRANCH) && !has_branch(project, BRANCH) {
+        git::git(project, &["branch", "-m", OLD_BRANCH, BRANCH])?;
+        git::git(project, &["config", MARK, "true"])?;
+    }
     if dir.join(".git").exists() {
         return Ok(dir);
+    }
+    if has_branch(project, BRANCH) && git::git(project, &["config", "--get", MARK]).is_err() {
+        return Err(format!("ce dépôt a déjà une branche « {BRANCH} » à vous : renommez-la pour utiliser la file d'intégration."));
     }
     if let Some(parent) = dir.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
     git::worktree_add(project, &dir, BRANCH)?;
+    git::git(project, &["config", MARK, "true"])?;
     crate::trust::link(&dir, project);
     Ok(dir)
 }
@@ -33,20 +51,20 @@ pub fn prepare(base: &Path, project: &Path) -> Result<PathBuf, String> {
 /// (build and tests: Ok(summary) or Err(output)). Kept only if both pass; else the
 /// worktree is back where it was. (merged, report for the session and the panel).
 pub fn integrate(dir: &Path, req: &MergeRequest, name: &str, check: impl Fn(&Path) -> Result<String, String>) -> (bool, String) {
-    let message = format!("akolade : fusion de {} ({name}) — {}", req.branch, req.summary);
+    let message = format!("Fusion de {} ({name}) : {}", req.branch, req.summary);
     match git::merge(dir, &req.branch, &message) {
         Integration::Conflict(files) => {
-            return (false, format!("Conflit avec akolade/integration sur : {}. Rien n'a été fusionné. Dans ton worktree : `git merge akolade/integration` (ou `git rebase akolade/integration`), résous les conflits, commite, puis request_merge à nouveau.", files.join(", ")));
+            return (false, format!("Conflit avec {BRANCH} sur : {}. Rien n'a été fusionné. Dans ton worktree : `git merge {BRANCH}` (ou `git rebase {BRANCH}`), résous les conflits, commite, puis request_merge à nouveau.", files.join(", ")));
         }
         Integration::Failed(e) => return (false, format!("La fusion n'a pas pu se faire : {e}")),
         Integration::Done => {}
     }
     match check(dir) {
-        Ok(summary) => (true, format!("Fusionnée dans akolade/integration. {summary}")),
+        Ok(summary) => (true, format!("Fusionnée dans {BRANCH}. {summary}")),
         Err(output) => {
             // Undone: the integration branch stays as it was before this merge.
             let _ = git::git(dir, &["reset", "--hard", "-q", "ORIG_HEAD"]);
-            (false, format!("Build ou tests en échec après la fusion : rien n'a été gardé. Corrige dans ton worktree (en partant de akolade/integration si besoin), commite, puis request_merge à nouveau.\n\n{output}"))
+            (false, format!("Build ou tests en échec après la fusion : rien n'a été gardé. Corrige dans ton worktree (en partant de {BRANCH} si besoin), commite, puis request_merge à nouveau.\n\n{output}"))
         }
     }
 }
@@ -97,7 +115,7 @@ mod tests {
             }
         };
         let session = |name: &str, line: &str| {
-            let wt = super::super::worktree::create(&base, &repo, name).unwrap();
+            let wt = super::super::worktree::create(&base, &repo, name, &super::super::worktree::branch_for(name)).unwrap();
             std::fs::write(wt.join(format!("{name}.txt")), line).unwrap();
             g(&wt, &["add", "."]);
             g(&wt, &["-c", "user.name=T", "-c", "user.email=t@e.st", "commit", "-qm", name]);
@@ -109,28 +127,61 @@ mod tests {
         assert!(integrate(&dir, &a, "a", check).0);
         assert!(integrate(&dir, &b, "b", check).0);
         let log = g(&dir, &["log", "--format=%s", "-3"]);
-        assert!(log.starts_with("akolade : fusion de akolade/b") && log.contains("akolade/a"), "in order: {log}");
+        assert!(log.starts_with("Fusion de session/b") && log.contains("session/a"), "in order: {log}");
         // A branch that breaks the tests: refused, the integration branch unchanged.
-        let wt = super::super::worktree::create(&base, &repo, "c").unwrap();
+        let wt = super::super::worktree::create(&base, &repo, "c", "session/c").unwrap();
         std::fs::write(wt.join("calc.txt"), "1+1=2\n2+2=5\n").unwrap();
         g(&wt, &["-c", "user.name=T", "-c", "user.email=t@e.st", "commit", "-qam", "c"]);
         let head = g(&dir, &["rev-parse", "HEAD"]);
-        let c = MergeRequest { session: "c".into(), branch: "akolade/c".into(), summary: "calculs".into(), at: 0 };
+        let c = MergeRequest { session: "c".into(), branch: "session/c".into(), summary: "calculs".into(), at: 0 };
         let (merged, report) = integrate(&dir, &c, "c", check);
         assert!(!merged && report.contains("faux : 2+2=5"), "{report}");
         assert_eq!(g(&dir, &["rev-parse", "HEAD"]), head, "nothing kept");
         // A conflict: refused too, nothing left behind.
         std::fs::write(wt.join("calc.txt"), "1+1=2\n3+3=6\n").unwrap();
         g(&wt, &["-c", "user.name=T", "-c", "user.email=t@e.st", "commit", "-qam", "c2"]);
-        let wd = super::super::worktree::create(&base, &repo, "d").unwrap();
+        let wd = super::super::worktree::create(&base, &repo, "d", "session/d").unwrap();
         std::fs::write(wd.join("calc.txt"), "1+1=2\n4+4=8\n").unwrap();
         g(&wd, &["-c", "user.name=T", "-c", "user.email=t@e.st", "commit", "-qam", "d"]);
-        assert!(integrate(&dir, &MergeRequest { branch: "akolade/c".into(), ..c.clone() }, "c", check).0);
-        let (merged, report) = integrate(&dir, &MergeRequest { session: "d".into(), branch: "akolade/d".into(), summary: "d".into(), at: 0 }, "d", check);
+        assert!(integrate(&dir, &MergeRequest { branch: "session/c".into(), ..c.clone() }, "c", check).0);
+        let (merged, report) = integrate(&dir, &MergeRequest { session: "d".into(), branch: "session/d".into(), summary: "d".into(), at: 0 }, "d", check);
         assert!(!merged && report.contains("Conflit") && report.contains("calc.txt"), "{report}");
         assert!(git::status(&dir).unwrap().changes.is_empty());
         // The user's branch never moved.
         assert_eq!(g(&repo, &["log", "--format=%s", "-1"]).trim(), "init");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn the_old_branch_is_renamed_and_a_branch_of_yours_is_never_taken() {
+        if !git::installed() {
+            return;
+        }
+        let tmp = std::env::temp_dir().join(format!("akolade-mux-queue-names-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let (repo, base) = (tmp.join("projet"), tmp.join("worktrees"));
+        std::fs::create_dir_all(&repo).unwrap();
+        let g = |args: &[&str]| git::git(&repo, args).unwrap();
+        g(&["init", "-q", "-b", "main"]);
+        g(&["-c", "user.name=T", "-c", "user.email=t@e.st", "commit", "-q", "--allow-empty", "-m", "init"]);
+        // 0.2: akolade/integration, checked out in its worktree.
+        let dir = dir(&base, &repo);
+        std::fs::create_dir_all(dir.parent().unwrap()).unwrap();
+        git::worktree_add(&repo, &dir, OLD_BRANCH).unwrap();
+        assert_eq!(prepare(&base, &repo).unwrap(), dir);
+        assert_eq!(git::git(&dir, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap().trim(), BRANCH, "the worktree follows");
+        assert!(!has_branch(&repo, OLD_BRANCH));
+        // Its worktree gone (cleaned up): its branch is known again as the queue's.
+        git::worktree_remove(&repo, &dir).unwrap();
+        assert_eq!(prepare(&base, &repo).unwrap(), dir);
+        // Another repository with an `integration` of its own: refused, untouched.
+        let other = tmp.join("autre");
+        std::fs::create_dir_all(&other).unwrap();
+        let o = |args: &[&str]| git::git(&other, args).unwrap();
+        o(&["init", "-q", "-b", "main"]);
+        o(&["-c", "user.name=T", "-c", "user.email=t@e.st", "commit", "-q", "--allow-empty", "-m", "init"]);
+        o(&["branch", BRANCH]);
+        assert!(prepare(&base, &other).unwrap_err().contains("à vous"));
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

@@ -87,6 +87,8 @@ struct Launch {
     conversation: Option<String>,
     flat: bool,
     terminal: Option<bool>,
+    /// An Isolated session's branch: `session/<id>`, or its own after a restart (0.2: `akolade/<id>`).
+    branch: Option<String>,
 }
 
 /// The "Nouvelle session" form.
@@ -143,7 +145,7 @@ fn rebase(wt: PathBuf, window: &mut Window, cx: &mut App) {
     window
         .spawn(cx, async move |cx| {
             let note = match task.await {
-                crate::git::Integration::Done => gpui_component::notification::Notification::success("Branche rebasée sur akolade/integration."),
+                crate::git::Integration::Done => gpui_component::notification::Notification::success("Branche rebasée sur integration."),
                 crate::git::Integration::Conflict(files) => gpui_component::notification::Notification::error(format!("Conflit sur {} : le rebase est annulé, demandez à la session de le faire elle-même.", files.join(", "))),
                 crate::git::Integration::Failed(e) => gpui_component::notification::Notification::error(format!("Rebase impossible : {e}")),
             };
@@ -210,8 +212,9 @@ impl MuxView {
                     // The project's own checkout is never an isolated session's worktree (it would work in yours).
                     let yours = canonical(&wt) == canonical(&info.project);
                     if !known || yours || !wt.join(".git").exists() {
-                        let slug = info.branch.as_deref().and_then(|b| b.strip_prefix("akolade/")).unwrap_or(&info.id).to_string();
-                        match worktree::create(&worktree::base(), &info.project, &slug) {
+                        // Its own branch again (0.2's sessions keep `akolade/<id>`).
+                        let branch = info.branch.clone().unwrap_or_else(|| worktree::branch_for(&info.id));
+                        match worktree::create(&worktree::base(), &info.project, &info.id, &branch) {
                             // Made again (maybe elsewhere): its folder, in the same subfolder as before.
                             Ok(made) => {
                                 let rel = info.cwd.strip_prefix(&info.checkout).map(Path::to_path_buf).unwrap_or_default();
@@ -261,6 +264,7 @@ impl MuxView {
                 conversation: Some(info.conversation.unwrap_or_default()).filter(|c| !c.is_empty()),
                 flat: info.flat,
                 terminal: info.terminal,
+                branch: info.branch,
             };
             self.start(launch, info.cwd, worktree, window, cx);
         }
@@ -375,7 +379,7 @@ impl MuxView {
                 menu.label("Une autre session sur ce projet")
                     .item(PopupMenuItem::element(row("Dans sa propre copie", "Réintégrée quand elle a fini ; un Claude tranche les conflits")).on_click(add(WorkMode::Copy)))
                     .item(PopupMenuItem::element(row("Dans le même dossier", "Partagé : chacune réserve les fichiers qu'elle modifie")).on_click(add(WorkMode::Direct)))
-                    .item(PopupMenuItem::element(row("Dans son propre worktree", if git { "Sa branche akolade/<nom>, fusionnée si les tests passent" } else { "Il faut un dépôt Git" })).disabled(!git).on_click(add(WorkMode::Isolated)))
+                    .item(PopupMenuItem::element(row("Dans son propre worktree", if git { "Sa branche session/<nom>, fusionnée si les tests passent" } else { "Il faut un dépôt Git" })).disabled(!git).on_click(add(WorkMode::Isolated)))
             })
             .into_any_element()
     }
@@ -440,17 +444,18 @@ impl MuxView {
             id = format!("{}-{}", project::slug(&name), self.next_id);
         }
         self.next_id += 1;
-        let launch = Launch { id, name, role, task, project, mode, model, perm, effort, budget, conversation: None, flat: !self.by_project, terminal: None };
+        let branch = (mode == WorkMode::Isolated).then(|| worktree::branch_for(&id));
+        let launch = Launch { id, name, role, task, project, mode, model, perm, effort, budget, conversation: None, flat: !self.by_project, terminal: None, branch };
         self.form = None;
         if mode == WorkMode::Direct {
             return self.start(launch, folder, None, window, cx);
         }
         // Its worktree or its copy first (off the UI thread), in the same subfolder as picked.
         let rel = folder.strip_prefix(&launch.project).map(Path::to_path_buf).unwrap_or_default();
-        let (project, slug) = (launch.project.clone(), launch.id.clone());
+        let (project, slug, branch) = (launch.project.clone(), launch.id.clone(), launch.branch.clone().unwrap_or_default());
         self.starting.push(launch.name.clone());
         cx.notify();
-        let made = cx.background_executor().spawn(async move { if mode == WorkMode::Copy { copy::create(&copy::base(), &project, &slug) } else { worktree::create(&worktree::base(), &project, &slug) } });
+        let made = cx.background_executor().spawn(async move { if mode == WorkMode::Copy { copy::create(&copy::base(), &project, &slug) } else { worktree::create(&worktree::base(), &project, &slug, &branch) } });
         cx.spawn_in(window, async move |this, cx| {
             let made = made.await;
             let _ = this.update_in(cx, |this, window, cx| {
@@ -469,7 +474,7 @@ impl MuxView {
 
     /// A session in `cwd` (its worktree's, if Isolated), its first instruction sent.
     fn start(&mut self, l: Launch, cwd: PathBuf, worktree: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
-        let branch = worktree.as_ref().filter(|_| l.mode == WorkMode::Isolated).map(|_| worktree::branch_for(&l.id));
+        let branch = l.branch.clone().filter(|_| worktree.is_some() && l.mode == WorkMode::Isolated);
         // Its paths are relative to its checkout: its worktree, or the project.
         let checkout = crate::platform::canonical(worktree.as_deref().unwrap_or(&l.project)).unwrap_or_else(|_| worktree.clone().unwrap_or_else(|| l.project.clone()));
         // Known to the coordinator first: its instructions name the sessions it works with.
@@ -575,7 +580,7 @@ impl MuxView {
                 async move {
                     match queue::prepare(&base, &project) {
                         Ok(dir) => queue::integrate(&dir, &req, &name, queue::project_check),
-                        Err(e) => (false, format!("Impossible de préparer akolade/integration : {e}")),
+                        Err(e) => (false, format!("Impossible de préparer la branche {} : {e}", queue::BRANCH)),
                     }
                 }
             });
@@ -624,19 +629,19 @@ impl MuxView {
         .detach();
     }
 
-    /// Your action: `akolade/integration` merged into the project's current branch (never pushed).
+    /// Your action: `integration` merged into the project's current branch (never pushed).
     fn merge_into_yours(&mut self, project: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         let branch = crate::git::git(&project, &["rev-parse", "--abbrev-ref", "HEAD"]).map(|b| b.trim().to_string()).unwrap_or_default();
-        let detail = format!("Les branches des sessions déjà fusionnées et testées dans akolade/integration rejoignent « {branch} » dans {}. Rien n'est poussé.", project.display());
+        let detail = format!("Les branches des sessions déjà fusionnées et testées dans integration rejoignent « {branch} » dans {}. Rien n'est poussé.", project.display());
         let answer = window.prompt(gpui::PromptLevel::Info, "Fusionner dans votre branche ?", Some(&detail), &["Fusionner", "Annuler"], cx);
         cx.spawn_in(window, async move |_, cx| {
             if answer.await != Ok(0) {
                 return;
             }
-            let done = cx.background_executor().spawn(async move { crate::git::merge(&project, queue::BRANCH, "akolade : intégration des sessions du multiplexeur") }).await;
+            let done = cx.background_executor().spawn(async move { crate::git::merge(&project, queue::BRANCH, "Intégration des sessions du multiplexeur") }).await;
             let _ = cx.update(|window, cx| {
                 let note = match done {
-                    crate::git::Integration::Done => gpui_component::notification::Notification::success(format!("akolade/integration est fusionnée dans « {branch} ».")),
+                    crate::git::Integration::Done => gpui_component::notification::Notification::success(format!("integration est fusionnée dans « {branch} ».")),
                     crate::git::Integration::Conflict(files) => gpui_component::notification::Notification::error(format!("Conflit avec votre branche sur {} : rien n'a été fusionné.", files.join(", "))),
                     crate::git::Integration::Failed(e) => gpui_component::notification::Notification::error(format!("Fusion impossible : {e}")),
                 };
@@ -696,7 +701,7 @@ impl MuxView {
                         })
                         .child(div().flex_1())
                         .when(has_branch, |d| {
-                            d.child(button(SharedString::from(format!("mux-merge-{key}"))).xsmall().outline().label("Fusionner dans votre branche").tooltip("akolade/integration rejoint votre branche courante, sur votre action (jamais de push)").on_click(cx.listener(move |this, _, window, cx| this.merge_into_yours(project.clone(), window, cx))))
+                            d.child(button(SharedString::from(format!("mux-merge-{key}"))).xsmall().outline().label("Fusionner dans votre branche").tooltip("La branche integration rejoint votre branche courante, sur votre action (jamais de push)").on_click(cx.listener(move |this, _, window, cx| this.merge_into_yours(project.clone(), window, cx))))
                         }),
                 )
                 .when_some(last.filter(|_| open), |d, o| {
@@ -824,7 +829,7 @@ impl MuxView {
         let mode = seg("mux-mode", FORM_MODES.iter().map(|m| m.label()).collect(), FORM_MODES.iter().position(|m| *m == form.mode).unwrap_or(0), |f, i| f.mode = FORM_MODES[i], cx);
         let mode_about = match form.mode {
             WorkMode::Direct => "Dans le dossier du projet, partagé avec les sessions qui y sont : chacune réserve les fichiers qu'elle modifie.",
-            WorkMode::Isolated => "Dans son propre worktree Git, sur la branche akolade/<nom> : rien ne touche votre copie.",
+            WorkMode::Isolated => "Dans son propre worktree Git, sur la branche session/<nom> : rien ne touche votre copie.",
             WorkMode::Copy => "Dans sa propre copie du dossier (sans Git), réintégrée quand elle a fini : un Claude tranche les fichiers modifiés des deux côtés.",
         };
         let models = self.render_model_picker(form.model, form.effort, cx);
@@ -1262,7 +1267,7 @@ impl MuxView {
                     }
                 };
                 menu.item(PopupMenuItem::new(if folded { "Déplier" } else { "Replier" }).on_click(fold))
-                    .when_some(wt.clone(), |m, wt| m.item(PopupMenuItem::new("Rebaser sur akolade/integration").on_click(move |_, window, cx| rebase(wt.clone(), window, cx))))
+                    .when_some(wt.clone(), |m, wt| m.item(PopupMenuItem::new("Rebaser sur integration").on_click(move |_, window, cx| rebase(wt.clone(), window, cx))))
                     .separator()
                     .label("Style de cette discussion")
                     .item(PopupMenuItem::new("Standard").checked(!terminal).on_click(look(false)))
@@ -1587,7 +1592,7 @@ fn coord_prompt(c: &coord::Coordinator, id: &str) -> String {
         out += if me.mode == WorkMode::Copy {
             ""
         } else if me.branch.is_some() {
-            " Quand ta tâche est terminée et commitée, appelle request_merge : ta branche n'est fusionnée dans akolade/integration que si le build et les tests passent."
+            " Quand ta tâche est terminée et commitée, appelle request_merge : ta branche n'est fusionnée dans la branche integration que si le build et les tests passent."
         } else {
             // Several in one folder: git's state is everyone's.
             " Tu travailles dans le dossier du projet, que d'autres sessions partagent peut-être : ne change pas de branche, ne fais ni git stash, ni git reset, ni git checkout de fichiers, et si tu commites, n'ajoute que les fichiers que tu as modifiés toi-même."

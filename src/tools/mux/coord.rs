@@ -93,7 +93,7 @@ pub struct Note {
     pub text: String,
 }
 
-/// A session's branch waiting to be merged into the project's `akolade/integration`.
+/// A session's branch waiting to be merged into the project's `integration`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MergeRequest {
     pub session: String,
@@ -462,7 +462,7 @@ impl Coordinator {
         let text = match (copy, merged) {
             (true, true) => format!("Copie de {name} réintégrée dans le dossier du projet"),
             (true, false) => format!("Copie de {name} non réintégrée"),
-            (false, true) => format!("Branche {} de {name} fusionnée dans akolade/integration", req.branch),
+            (false, true) => format!("Branche {} de {name} fusionnée dans integration", req.branch),
             (false, false) => format!("Branche {} de {name} renvoyée (build, tests ou conflit)", req.branch),
         };
         self.note(Some(project), text, now);
@@ -622,13 +622,13 @@ mod tests {
     fn merge_requests_queue_in_order_per_project() {
         let mut c = Coordinator::default();
         let mut a = info("a", "/x", "/wt/x/a");
-        a.branch = Some("akolade/a".into());
+        a.branch = Some("session/a".into());
         let mut b = info("b", "/x", "/wt/x/b");
-        b.branch = Some("akolade/b".into());
+        b.branch = Some("session/b".into());
         let mut d = info("d", "/x", "/x");
         d.mode = WorkMode::Direct;
         let mut y = info("y", "/y", "/wt/y/y");
-        y.branch = Some("akolade/y".into());
+        y.branch = Some("session/y".into());
         for s in [a, b, d, y] {
             c.add(s);
         }
@@ -655,7 +655,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let mut c = Coordinator::default();
         let mut a = info("a", "/x", "/wt/x/a");
-        a.branch = Some("akolade/a".into());
+        a.branch = Some("session/a".into());
         a.conversation = Some("conv-a".into());
         c.add(a);
         c.add(info("b", "/x", "/wt/x/b"));

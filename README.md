@@ -94,7 +94,7 @@ L'outil Multiplexeur fait travailler plusieurs sessions Claude Code en parallèl
 |---|---|---|
 | **Copie** (par défaut dès la deuxième session, sans Git) | Sa propre copie du dossier du projet | Elle demande sa réintégration : ses fichiers reviennent un par un dans le projet. Un fichier modifié des deux côtés à des endroits différents est fusionné ligne à ligne ; aux mêmes endroits, un Claude tranche seul, à partir des explications des deux côtés |
 | **Directe** | Le dossier du projet, comme vous | Ses modifications y sont déjà |
-| **Isolée** (dépôt Git) | Son worktree, sur la branche `akolade/<session>` | Sa branche passe par la file d'intégration testée |
+| **Isolée** (dépôt Git) | Son worktree, sur la branche `session/<session>` | Sa branche passe par la file d'intégration testée |
 
 Ce que le multiplexeur apporte :
 
@@ -102,7 +102,7 @@ Ce que le multiplexeur apporte :
 - **Les sessions qui attendent votre accord** sont surlignées et comptées en haut de la vue : aucune ne reste bloquée sans que vous le voyiez.
 - **Les baux de fichiers.** Une session qui modifie un fichier le réserve. Si une autre session du même projet veut l'écrire, Akolade refuse aussitôt, en donnant le nom du détenteur et son intention ; elle réessaie une fois le fichier libéré. Les baux d'un projet n'affectent jamais un autre projet, et vous pouvez en libérer un de force.
 - **Une messagerie.** Les sessions s'écrivent entre elles, même d'un projet à l'autre (une API et son client), par un serveur MCP intégré à Akolade. Le panneau « Échanges » montre le fil des messages et des événements, et vous permet d'écrire à une session, à un projet ou à toutes.
-- **Une file d'intégration par projet.** Une session qui a fini demande la fusion de sa branche. Akolade la fusionne dans `akolade/integration`, une à la fois et dans l'ordre, seulement si le build et les tests passent. Sinon, la session reçoit l'erreur ou la liste des conflits et corrige. Votre branche ne change que sur votre clic « Fusionner dans votre branche ». Rien n'est jamais poussé.
+- **Une file d'intégration par projet.** Une session qui a fini demande la fusion de sa branche. Akolade la fusionne dans la branche `integration` du projet, une à la fois et dans l'ordre, seulement si le build et les tests passent. Sinon, la session reçoit l'erreur ou la liste des conflits et corrige. Votre branche ne change que sur votre clic « Fusionner dans votre branche ». Rien n'est jamais poussé.
 - **Les réglages par session** : modèle, mode d'autorisation, effort et budget. Les coûts s'affichent par session, par projet et au total. Les limites de l'abonnement sont communes à toutes les sessions.
 - **Le panneau Statistiques** : le coût et les tokens des sessions du multiplexeur, et les chiffres de Claude Code tous usages confondus (sessions, messages sur 30 jours, heure favorite, plus longue session, tokens par modèle).
 - **Après un redémarrage**, les sessions reviennent en pause sur leur conversation, avec leurs messages et leurs baux. Les worktrees abandonnés sont nettoyés, et leur travail non commité est gardé sur leur branche. Une copie fermée avec du travail non réintégré est gardée, jamais remplacée.

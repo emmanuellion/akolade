@@ -1,5 +1,5 @@
 //! The Isolated sessions' worktrees: in Akolade's folder, out of the projects, one
-//! folder per project (`worktrees/<project key>/<session>`), on `akolade/<session>`.
+//! folder per project (`worktrees/<project key>/<session>`), on `session/<session>`.
 
 use std::path::{Path, PathBuf};
 
@@ -14,17 +14,18 @@ pub fn dir_for(base: &Path, project: &Path, slug: &str) -> PathBuf {
     base.join(project::key(project)).join(slug)
 }
 
+/// A new session's branch (0.2's were `akolade/<session>`: those sessions keep theirs).
 pub fn branch_for(slug: &str) -> String {
-    format!("akolade/{slug}")
+    format!("session/{slug}")
 }
 
-/// A worktree of `project` for the session `slug`, trusted as its project is.
-pub fn create(base: &Path, project: &Path, slug: &str) -> Result<PathBuf, String> {
+/// A worktree of `project` for the session `slug`, on `branch`, trusted as its project is.
+pub fn create(base: &Path, project: &Path, slug: &str, branch: &str) -> Result<PathBuf, String> {
     let dir = dir_for(base, project, slug);
     if let Some(parent) = dir.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    crate::git::worktree_add(project, &dir, &branch_for(slug))?;
+    crate::git::worktree_add(project, &dir, branch)?;
     crate::trust::link(&dir, project);
     Ok(dir)
 }
@@ -42,7 +43,7 @@ fn repo_of(dir: &Path) -> Option<PathBuf> {
 pub fn remove(dir: &Path) {
     if crate::git::status(dir).is_ok_and(|s| !s.changes.is_empty()) {
         let _ = crate::git::git(dir, &["add", "-A"]);
-        let _ = crate::git::git(dir, &["-c", "user.name=Akolade", "-c", "user.email=akolade@localhost", "commit", "-q", "--no-verify", "-m", "akolade : travail en cours de la session, gardé à sa fermeture"]);
+        let _ = crate::git::git(dir, &["-c", "user.name=Akolade", "-c", "user.email=akolade@localhost", "commit", "-q", "--no-verify", "-m", "Travail en cours de la session, gardé à sa fermeture"]);
     }
     crate::trust::unlink(dir);
     match repo_of(dir) {
@@ -105,19 +106,19 @@ mod tests {
         g(&["add", "."]);
         g(&["commit", "-qm", "init"]);
 
-        let a = create(&base, &repo, "front").unwrap();
-        let b = create(&base, &repo, "back").unwrap();
+        let a = create(&base, &repo, "front", &branch_for("front")).unwrap();
+        let b = create(&base, &repo, "back", &branch_for("back")).unwrap();
         assert_eq!(a, dir_for(&base, &repo, "front"));
         assert!(a.join("a.txt").exists() && repo_of(&a).is_some());
-        assert!(crate::git::branches(&repo).contains(&"akolade/front".to_string()));
+        assert!(crate::git::branches(&repo).contains(&"session/front".to_string()));
         // `a` had work not committed: kept on its branch when it goes.
         std::fs::write(a.join("nouveau.txt"), "brouillon").unwrap();
         // `b` belongs to a running session; `a` was left behind.
         assert_eq!(orphans(&base, std::slice::from_ref(&b)), vec![a.clone()]);
         assert_eq!(cleanup(&base, std::slice::from_ref(&b)), vec![a.clone()]);
         assert!(!a.exists() && b.exists());
-        assert!(crate::git::branches(&repo).contains(&"akolade/front".to_string()), "its branch stays");
-        assert_eq!(g(&["show", "akolade/front:nouveau.txt"]), "brouillon", "its uncommitted work is on its branch");
+        assert!(crate::git::branches(&repo).contains(&"session/front".to_string()), "its branch stays");
+        assert_eq!(g(&["show", "session/front:nouveau.txt"]), "brouillon", "its uncommitted work is on its branch");
         // A worktree whose project is gone: its folder is deleted all the same.
         std::fs::remove_dir_all(&repo).unwrap();
         cleanup(&base, &[]);

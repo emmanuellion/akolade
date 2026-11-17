@@ -878,11 +878,11 @@ mod tests {
 
         // Two worktrees on their own branches, outside the repository.
         let (wa, wb) = (base.join("wt/a"), base.join("wt/b"));
-        worktree_add(&repo, &wa, "akolade/a").unwrap();
-        worktree_add(&repo, &wb, "akolade/b").unwrap();
+        worktree_add(&repo, &wa, "session/a").unwrap();
+        worktree_add(&repo, &wb, "session/b").unwrap();
         let list = worktree_list(&repo);
         assert_eq!(list.len(), 3, "{list:?}");
-        assert!(list.iter().any(|(_, b)| b.as_deref() == Some("akolade/a")));
+        assert!(list.iter().any(|(_, b)| b.as_deref() == Some("session/a")));
         assert!(paused(&wa).is_none());
 
         // a and b change different lines: both merge; then b changes what a changed: conflict.
@@ -890,20 +890,20 @@ mod tests {
         g(&wa, &["commit", "-qam", "a"]);
         std::fs::write(wb.join("a.txt"), "un\ndeux\nTROIS\n").unwrap();
         g(&wb, &["commit", "-qam", "b"]);
-        assert_eq!(merge(&repo, "akolade/a", "Fusion de a"), Integration::Done);
-        assert_eq!(merge(&repo, "akolade/b", "Fusion de b"), Integration::Done);
+        assert_eq!(merge(&repo, "session/a", "Fusion de a"), Integration::Done);
+        assert_eq!(merge(&repo, "session/b", "Fusion de b"), Integration::Done);
         assert_eq!(std::fs::read_to_string(repo.join("a.txt")).unwrap(), "UN\ndeux\nTROIS\n");
         std::fs::write(wb.join("a.txt"), "Un\ndeux\nTROIS\n").unwrap();
         g(&wb, &["commit", "-qam", "b2"]);
-        assert_eq!(merge(&repo, "akolade/b", "Fusion de b2"), Integration::Conflict(vec!["a.txt".into()]));
+        assert_eq!(merge(&repo, "session/b", "Fusion de b2"), Integration::Conflict(vec!["a.txt".into()]));
         assert!(status(&repo).unwrap().changes.is_empty(), "a conflict leaves nothing behind");
         assert_eq!(rebase(&wb, "main"), Integration::Conflict(vec!["a.txt".into()]));
-        assert_eq!(g(&wb, &["rev-parse", "--abbrev-ref", "HEAD"]).trim(), "akolade/b", "the rebase is undone");
+        assert_eq!(g(&wb, &["rev-parse", "--abbrev-ref", "HEAD"]).trim(), "session/b", "the rebase is undone");
 
         // Removed: its folder goes, its branch stays; added again, it goes on from the branch.
         worktree_remove(&repo, &wb).unwrap();
-        assert!(!wb.exists() && branches(&repo).contains(&"akolade/b".to_string()));
-        worktree_add(&repo, &wb, "akolade/b").unwrap();
+        assert!(!wb.exists() && branches(&repo).contains(&"session/b".to_string()));
+        worktree_add(&repo, &wb, "session/b").unwrap();
         assert_eq!(std::fs::read_to_string(wb.join("a.txt")).unwrap(), "Un\ndeux\nTROIS\n");
         // A folder deleted by hand: pruned.
         std::fs::remove_dir_all(&wa).unwrap();
@@ -914,8 +914,8 @@ mod tests {
 
     #[test]
     fn worktree_lists_are_read() {
-        let out = "worktree /r\nHEAD abc\nbranch refs/heads/main\n\nworktree /w/a\nHEAD def\nbranch refs/heads/akolade/a\n\nworktree /w/d\nHEAD 123\ndetached\n";
-        assert_eq!(parse_worktrees(out), vec![(PathBuf::from("/r"), Some("main".into())), (PathBuf::from("/w/a"), Some("akolade/a".into())), (PathBuf::from("/w/d"), None)]);
+        let out = "worktree /r\nHEAD abc\nbranch refs/heads/main\n\nworktree /w/a\nHEAD def\nbranch refs/heads/session/a\n\nworktree /w/d\nHEAD 123\ndetached\n";
+        assert_eq!(parse_worktrees(out), vec![(PathBuf::from("/r"), Some("main".into())), (PathBuf::from("/w/a"), Some("session/a".into())), (PathBuf::from("/w/d"), None)]);
     }
 
     #[test]

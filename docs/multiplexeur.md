@@ -105,7 +105,7 @@ Les sessions Directes d'un même dossier partagent l'état de Git : leurs consig
 
 ### 2.3 Worktrees
 
-Les sessions Isolées travaillent dans `app_dir()/worktrees/<projet>/<session>`, sur la branche `akolade/<session>` créée depuis la branche courante de l'utilisateur. `<projet>` est le nom du dossier suivi d'un court hachage de son chemin, pour que deux projets homonymes ne se mélangent pas.
+Les sessions Isolées travaillent dans `app_dir()/worktrees/<projet>/<session>`, sur la branche `session/<session>` créée depuis la branche courante de l'utilisateur (les sessions créées en 0.2 gardent leur `akolade/<session>`). `<projet>` est le nom du dossier suivi d'un court hachage de son chemin, pour que deux projets homonymes ne se mélangent pas.
 
 À la fermeture d'une session, son worktree est retiré mais **sa branche est gardée** : son travail n'est jamais perdu. Au lancement d'Akolade, tout dossier de `worktrees/` sans session enregistrée est un orphelin. Il est retiré avec `git worktree remove --force`, ou supprimé puis `git worktree prune` si le projet n'existe plus.
 
@@ -136,12 +136,12 @@ Le JSON-RPC est écrit à la main avec serde_json : `initialize`, `tools/list`, 
 
 ### 2.6 File d'intégration
 
-Chaque projet a sa branche `akolade/integration`, dans un worktree `worktrees/<projet>/integration`. `request_merge` met la branche de la session en file (FIFO). Le traitement, une demande à la fois par projet, se fait en arrière-plan :
-1. `git merge --no-ff akolade/<session>` dans le worktree d'intégration. En cas de conflit : `merge --abort`, et la liste des fichiers est renvoyée à la session.
+Chaque projet a sa branche `integration`, dans un worktree `worktrees/<projet>/integration`. Akolade la marque (`git config branch.integration.multiplexeur true`) : une branche `integration` à vous n'est jamais prise pour elle, la file refuse de démarrer et vous demande de la renommer. Celle de la 0.2, `akolade/integration`, est renommée au premier usage. `request_merge` met la branche de la session en file (FIFO). Le traitement, une demande à la fois par projet, se fait en arrière-plan :
+1. `git merge --no-ff session/<session>` dans le worktree d'intégration. En cas de conflit : `merge --abort`, et la liste des fichiers est renvoyée à la session.
 2. Build et tests avec la commande détectée par l'outil Tests (cargo, go, pytest, jest, vitest). En cas d'échec : `reset --hard` sur l'état d'avant, et la fin de la sortie est renvoyée à la session.
 3. Sinon, la fusion est gardée et annoncée dans les Échanges.
 
-Fusionner `akolade/integration` dans la branche de l'utilisateur se fait seulement par son bouton. Il n'y a jamais de push.
+Fusionner `integration` dans la branche de l'utilisateur se fait seulement par son bouton. Il n'y a jamais de push.
 
 ### 2.7 Confiance
 
@@ -206,10 +206,10 @@ Trois sessions sur `/tmp/akolade-demo/calc`. Choisissez **Isolée** pour chacune
 | `casse` | Modifie `add` dans src/lib.rs pour qu'elle renvoie `a + b + 1`, sans toucher aux tests. Commite, puis appelle request_merge. |
 
 Ce qu'on observe :
-1. Chaque session travaille dans son worktree (barre « Isolée · akolade/mul-1 »…). Votre copie de `calc` ne bouge pas.
+1. Chaque session travaille dans son worktree (barre « Isolée · session/mul-1 »…). Votre copie de `calc` ne bouge pas.
 2. `mul` réserve `src/lib.rs` : le bail apparaît sous l'en-tête du projet. Quand `div` (ou `casse`) veut écrire ce fichier, sa carte passe en « Refusé ». Sa barre indique « Bloquée par un bail » et la raison, avec le nom `mul`, s'affiche en infobulle. La session attend ou écrit à `mul`, puis réessaie après la libération (le fil apparaît dans « Échanges »).
-3. Les demandes de fusion passent dans la file du projet, une à la fois. Les branches de `mul` et `div` arrivent sur `akolade/integration` après `cargo test`. Celle de `casse` est renvoyée : `adds` échoue, rien n'est fusionné, et la session reçoit le rapport dans sa conversation.
-4. « Fusionner dans votre branche » apporte `akolade/integration` à `main`, sur votre confirmation. Rien n'est poussé.
+3. Les demandes de fusion passent dans la file du projet, une à la fois. Les branches de `mul` et `div` arrivent sur `integration` après `cargo test`. Celle de `casse` est renvoyée : `adds` échoue, rien n'est fusionné, et la session reçoit le rapport dans sa conversation.
+4. « Fusionner dans votre branche » apporte `integration` à `main`, sur votre confirmation. Rien n'est poussé.
 
 ### Scénario B : plusieurs projets à la fois
 

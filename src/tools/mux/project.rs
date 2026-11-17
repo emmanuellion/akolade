@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 pub enum WorkMode {
     /// In the project's folder itself.
     Direct,
-    /// In a git worktree of its own, on the branch `akolade/<session>`.
+    /// In a git worktree of its own, on the branch `session/<session>`.
     Isolated,
     /// In a copy of the project's folder (no git needed), brought back when done (see `copy`).
     Copy,
